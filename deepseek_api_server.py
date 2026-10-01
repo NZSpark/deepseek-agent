@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import re
 import time
 import uuid
@@ -113,6 +114,18 @@ _SESSION_URL_RE = re.compile(r"https://chat\.deepseek\.com/a/chat/s/[0-9a-fA-F-]
 
 class DeepSeekTimeoutError(RuntimeError):
     """等待网页版回复超时。区别于普通运行时错误，可触发会话恢复。"""
+
+
+# ==================== 2.6 回复结束检测 / 超时参数 ====================
+# 总超时（秒）：网页版长回答（尤其生成代码）可能远超 1 分钟，
+# 可用环境变量 DEEPSEEK_TIMEOUT 覆盖。
+RESPONSE_TIMEOUT_S = float(os.environ.get("DEEPSEEK_TIMEOUT", "300"))
+# 轮询间隔（秒）
+POLL_INTERVAL_S = 1.5
+# 兜底判定：内容（忽略首尾空白）连续稳定这么多次即认为生成结束
+STABLE_POLLS = 2
+# 回复节点的候选选择器
+RESPONSE_SELECTORS = '.ds-markdown, .markdown-body, div[class*="markdown"]'
 
 
 # ==================== 2. 工具调用（function calling）桥接层 ====================
@@ -486,8 +499,11 @@ class DeepSeekWebDriver:
     async def send_chat(self, prompt: str, on_delta=None) -> tuple[str, List[dict]]:
         """发送单条消息并获取响应。
 
-        正常路径委托给 ``_send_chat_locked``；一旦等待回复超时，
+        正常路径委托给 ``_send_chat_locked``；一旦等待回复超时
+        （此时说明页面上完全没有产生新回复，消息很可能根本没发出去），
         则根据保存的会话链接重新进入会话并重试一次。
+        如果超时前已经读到实质回复，``_send_chat_locked`` 会直接返回内容，
+        不再触发重发，避免网页多出一轮、与 Pi 的状态错位。
         """
         await self._remember_session()
         try:
@@ -498,6 +514,67 @@ class DeepSeekWebDriver:
                 await self._remember_session()
                 return await self._send_chat_locked(prompt, on_delta)
             raise
+
+    # 主判定所用的 JS：扫描页面上可见的「停止生成」控件
+    _GENERATING_JS = """
+    () => {
+      const words = ['\u505c\u6b62', 'stop', 'Stop', 'STOP'];
+      const nodes = document.querySelectorAll(
+        'button, [role="button"], div[class*="stop"], span[class*="stop"], svg[class*="stop"]'
+      );
+      for (const el of nodes) {
+        const label = [
+          el.getAttribute('aria-label') || '',
+          el.getAttribute('title') || '',
+          (el.textContent || '').slice(0, 40),
+        ].join(' ');
+        const cls = typeof el.className === 'string' ? el.className : '';
+        if (!words.some((w) => label.includes(w)) && !/stop/i.test(cls)) continue;
+        const rect = el.getBoundingClientRect();
+        // 必须可见，且位于视口下半部（停止按钮就在底部输入框区域），
+        // 避免把正文里含有 stop / 停止 字样的元素误判成生成中
+        if (rect.width > 0 && rect.height > 0 && rect.top > window.innerHeight * 0.5) {
+          return true;
+        }
+      }
+      return false;
+    }
+    """
+
+    async def _page_is_generating(self) -> Optional[bool]:
+        """检测页面是否仍在生成回复。
+
+        True=生成中；False=页面上找不到「停止生成」控件；None=检测失败/无法判断。
+        注意：只有在观测到过 True 之后，False 才可信，调用方需自行记录。
+        """
+        try:
+            return bool(await self.page.evaluate(self._GENERATING_JS))
+        except Exception:
+            return None
+
+    async def _extract_code_blocks(self, element) -> List[dict]:
+        """从某条回复的 DOM 节点中提取代码块（语言 + 纯代码文本）。"""
+        extracted: List[dict] = []
+        if element is None:
+            return extracted
+        code_elements = await element.query_selector_all('pre')
+        for code_el in code_elements:
+            code_tag = await code_el.query_selector('code')
+            lang = "txt"
+            if code_tag:
+                class_attr = await code_tag.get_attribute('class') or ""
+                lang_match = re.search(r'language-(\w+)', class_attr)
+                if lang_match:
+                    lang = lang_match.group(1)
+
+            code_content = await (code_tag or code_el).inner_text()
+            clean_code = re.sub(
+                r'^(?:' + lang + r'|bash|python|json|html|javascript)?\s*(?:Copy|Download)\s*\n',
+                '', code_content, flags=re.IGNORECASE
+            ).strip()
+
+            extracted.append({"lang": lang, "code": clean_code})
+        return extracted
 
     async def _send_chat_locked(self, prompt: str, on_delta=None) -> tuple[str, List[dict]]:
         """发送单条消息并获取响应及提取的代码块。
@@ -526,74 +603,73 @@ class DeepSeekWebDriver:
                 raise RuntimeError("无法找到对话输入框，请检查 DeepSeek 网页是否打开或处于登录状态。")
 
             # 记录发送前的回复数量，确保等待的是“新”回复而非旧回复
-            baseline = await self.page.query_selector_all('.ds-markdown, .markdown-body, div[class*="markdown"]')
+            baseline = await self.page.query_selector_all(RESPONSE_SELECTORS)
             baseline_count = len(baseline)
 
             await chat_input.fill(prompt)
             await self.page.keyboard.press("Enter")
 
             # 2. 轮询等待回复完成
-            await asyncio.sleep(2)
+            await asyncio.sleep(POLL_INTERVAL_S)
             last_text = ""
+            last_normalized = ""
             stable_count = 0
-            retry_empty_count = 0
-            deadline = asyncio.get_event_loop().time() + 180  # 总超时 180 秒
+            saw_generating = False      # 本轮是否观测到过页面「生成中」状态
+            latest_node = None          # 本轮最新的回复节点
+            deadline = asyncio.get_event_loop().time() + RESPONSE_TIMEOUT_S
 
             while True:
-                if asyncio.get_event_loop().time() > deadline:
-                    await self._remember_session()
-                    raise DeepSeekTimeoutError("等待 DeepSeek 响应超时（180s）。")
-
-                responses = await self.page.query_selector_all('.ds-markdown, .markdown-body, div[class*="markdown"]')
+                responses = await self.page.query_selector_all(RESPONSE_SELECTORS)
                 # 必须出现比发送前更多的新回复块，才认为是本轮响应
                 if responses and len(responses) > baseline_count:
-                    current_text = await responses[-1].inner_text()
-                    if current_text == last_text and len(current_text) > 0:
+                    latest_node = responses[-1]
+                    current_text = await latest_node.inner_text()
+
+                    # 2.1 主判定：页面「生成中」状态。一旦观测到过「停止生成」
+                    #     控件、又发现它消失，就说明生成真正结束，可立即收尾，
+                    #     无需再等文本稳定（解决尾部重排导致的假死）
+                    generating = await self._page_is_generating()
+                    if generating:
+                        saw_generating = True
+                    elif generating is False and saw_generating:
+                        if current_text:
+                            last_text = current_text
+                        break
+
+                    # 2.2 兜底判定：内容（忽略首尾空白）连续稳定多次
+                    normalized = current_text.strip()
+                    if normalized and normalized == last_normalized:
                         stable_count += 1
-                        # 连续两次内容不变才判定生成结束，避免过早截断
-                        if stable_count >= 2:
+                        if stable_count >= STABLE_POLLS:
+                            last_text = current_text
                             break
                     else:
                         stable_count = 0
-                        # 生成过程中吐出增量，供 SSE 使用
-                        if on_delta is not None and current_text.startswith(last_text):
-                            piece = current_text[len(last_text):]
-                            if piece:
-                                await on_delta(piece)
-                        last_text = current_text
-                else:
-                    retry_empty_count += 1
-                    if retry_empty_count > 120:
-                        await self._remember_session()
-                        raise DeepSeekTimeoutError("等待 DeepSeek 响应超时。")
 
-                await asyncio.sleep(1.5)
+                    # 2.3 生成过程中吐出增量，供 SSE 使用
+                    if on_delta is not None and current_text.startswith(last_text):
+                        piece = current_text[len(last_text):]
+                        if piece:
+                            await on_delta(piece)
 
-            # 3. DOM 提取优化：直接从页面中的 <pre> 或代码块 DOM 提取纯代码文本
-            extracted_blocks = []
-            if responses:
-                latest_response = responses[-1]
-                code_elements = await latest_response.query_selector_all('pre')
-                for code_el in code_elements:
-                    code_tag = await code_el.query_selector('code')
-                    lang = "txt"
-                    if code_tag:
-                        class_attr = await code_tag.get_attribute('class') or ""
-                        lang_match = re.search(r'language-(\w+)', class_attr)
-                        if lang_match:
-                            lang = lang_match.group(1)
+                    last_text = current_text
+                    last_normalized = normalized
 
-                    if code_tag:
-                        code_content = await code_tag.inner_text()
-                    else:
-                        code_content = await code_el.inner_text()
+                # 总超时判定：若这期间其实已经读到实质回复，就直接返回已产生的内容，
+                # 绝不再把同一句 prompt 重发一遍（避免网页多出一轮、与 Pi 状态错位）
+                if asyncio.get_event_loop().time() > deadline:
+                    await self._remember_session()
+                    if last_text:
+                        print("[超时] 已读取到回复内容，直接返回，不重发。")
+                        break
+                    raise DeepSeekTimeoutError(
+                        f"等待 DeepSeek 响应超时（{int(RESPONSE_TIMEOUT_S)}s）。"
+                    )
 
-                    clean_code = re.sub(
-                        r'^(?:' + lang + r'|bash|python|json|html|javascript)?\s*(?:Copy|Download)\s*\n',
-                        '', code_content, flags=re.IGNORECASE
-                    ).strip()
+                await asyncio.sleep(POLL_INTERVAL_S)
 
-                    extracted_blocks.append({"lang": lang, "code": clean_code})
+            # 3. 从最新回复节点中提取代码块
+            extracted_blocks = await self._extract_code_blocks(latest_node)
 
             # 成功产生回复后，刷新保存的会话地址（可能刚创建了新会话）
             await self._remember_session()
