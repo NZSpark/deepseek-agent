@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -117,13 +118,18 @@ class DeepSeekTimeoutError(RuntimeError):
 
 
 # ==================== 2.6 回复结束检测 / 超时参数 ====================
-# 总超时（秒）：网页版长回答（尤其生成代码）可能远超 1 分钟，
-# 可用环境变量 DEEPSEEK_TIMEOUT 覆盖。
-RESPONSE_TIMEOUT_S = float(os.environ.get("DEEPSEEK_TIMEOUT", "300"))
+# 总超时（秒）：仅在「结束判定完全失灵 / 消息压根没发出去」时才会用到的兜底。
+# 必须小于 Pi 侧 HTTP 客户端的超时，否则客户端会先报错。可用 DEEPSEEK_TIMEOUT 覆盖。
+RESPONSE_TIMEOUT_S = float(os.environ.get("DEEPSEEK_TIMEOUT", "180"))
+# 打开后每轮轮询都打印一行状态，便于定位「为什么一直判不到结束」（DEEPSEEK_DEBUG=1）
+DEBUG = os.environ.get("DEEPSEEK_DEBUG", "").lower() in {"1", "true", "yes", "on"}
 # 轮询间隔（秒）
 POLL_INTERVAL_S = 1.5
-# 兜底判定：内容（忽略首尾空白）连续稳定这么多次即认为生成结束
+# 兜底判定：内容（忽略首尾空白）完全相同连续这么多次即认为生成结束
 STABLE_POLLS = 2
+# 次保守的兜底：仅凭“长度不再增长”收尾时要多等几轮，
+# 避免生成中途的长停顿（如长思考）被误判成结束
+LEN_STABLE_POLLS = 4
 # 回复节点的候选选择器
 RESPONSE_SELECTORS = '.ds-markdown, .markdown-body, div[class*="markdown"]'
 
@@ -552,6 +558,44 @@ class DeepSeekWebDriver:
         except Exception:
             return None
 
+    _STOP_CANDIDATES_JS = """
+    () => {
+      const words = ['\u505c\u6b62', 'stop', 'Stop', 'STOP'];
+      const nodes = document.querySelectorAll(
+        'button, [role="button"], div[class*="stop"], span[class*="stop"], svg[class*="stop"], [aria-label]'
+      );
+      const out = [];
+      for (const el of nodes) {
+        const aria = el.getAttribute('aria-label') || '';
+        const title = el.getAttribute('title') || '';
+        const text = (el.textContent || '').slice(0, 40);
+        const cls = typeof el.className === 'string' ? el.className : '';
+        const label = [aria, title, text].join(' ');
+        if (!words.some((w) => label.includes(w)) && !/stop/i.test(cls)) continue;
+        const r = el.getBoundingClientRect();
+        out.push({
+          tag: el.tagName,
+          cls: cls.slice(0, 120),
+          aria,
+          title,
+          text: text.slice(0, 40),
+          visible: r.width > 0 && r.height > 0,
+          top: Math.round(r.top),
+          vh: window.innerHeight,
+        });
+        if (out.length >= 20) break;
+      }
+      return out;
+    }
+    """
+
+    async def debug_stop_candidates(self) -> List[dict]:
+        """诊断用：列出页面上所有「可能表示生成中」的控件及其位置。"""
+        try:
+            return await self.page.evaluate(self._STOP_CANDIDATES_JS)
+        except Exception as exc:  # noqa: BLE001
+            return [{"error": str(exc)}]
+
     async def _extract_code_blocks(self, element) -> List[dict]:
         """从某条回复的 DOM 节点中提取代码块（语言 + 纯代码文本）。"""
         extracted: List[dict] = []
@@ -602,9 +646,18 @@ class DeepSeekWebDriver:
             if not chat_input:
                 raise RuntimeError("无法找到对话输入框，请检查 DeepSeek 网页是否打开或处于登录状态。")
 
-            # 记录发送前的回复数量，确保等待的是“新”回复而非旧回复
-            baseline = await self.page.query_selector_all(RESPONSE_SELECTORS)
-            baseline_count = len(baseline)
+            # 记录发送前最后一条回复的文本，用来判断“新回复是否已经出现”。
+            # 注意：绝不能用“回复节点数量变多”来判断。
+            # DeepSeek 的消息列表会回收/替换节点，长会话下节点数可能恒为 2，
+            # 新回复只会把旧节点内容改掉而不会让数量增长，
+            # 那样会导致永远读不到本轮回复直接等到超时。
+            before_text = ""
+            try:
+                before_nodes = await self.page.query_selector_all(RESPONSE_SELECTORS)
+                if before_nodes:
+                    before_text = (await before_nodes[-1].inner_text()).strip()
+            except Exception:
+                before_text = ""
 
             await chat_input.fill(prompt)
             await self.page.keyboard.press("Enter")
@@ -613,35 +666,52 @@ class DeepSeekWebDriver:
             await asyncio.sleep(POLL_INTERVAL_S)
             last_text = ""
             last_normalized = ""
+            last_len = -1
             stable_count = 0
             saw_generating = False      # 本轮是否观测到过页面「生成中」状态
             latest_node = None          # 本轮最新的回复节点
+            poll = 0
             deadline = asyncio.get_event_loop().time() + RESPONSE_TIMEOUT_S
 
             while True:
+                poll += 1
                 responses = await self.page.query_selector_all(RESPONSE_SELECTORS)
-                # 必须出现比发送前更多的新回复块，才认为是本轮响应
-                if responses and len(responses) > baseline_count:
+                current_text = ""
+                generating = None
+                if responses:
                     latest_node = responses[-1]
                     current_text = await latest_node.inner_text()
+                normalized = current_text.strip()
 
+                # 1. 本轮回复是否已经出现：只要最后一条回复的内容与发送前不同即可。
+                #    （不看节点数量：长会话下新回复会原地替换旧节点，数量不增长）
+                if normalized and normalized != before_text:
                     # 2.1 主判定：页面「生成中」状态。一旦观测到过「停止生成」
-                    #     控件、又发现它消失，就说明生成真正结束，可立即收尾，
-                    #     无需再等文本稳定（解决尾部重排导致的假死）
+                    #     控件、又发现它消失，就说明生成真正结束，可立即收尾
                     generating = await self._page_is_generating()
                     if generating:
                         saw_generating = True
                     elif generating is False and saw_generating:
-                        if current_text:
-                            last_text = current_text
+                        last_text = current_text
+                        if DEBUG:
+                            print(f"[debug] poll={poll} 停止按钮已消失，判定结束")
                         break
 
-                    # 2.2 兜底判定：内容（忽略首尾空白）连续稳定多次
-                    normalized = current_text.strip()
-                    if normalized and normalized == last_normalized:
+                    # 2.2 兜底判定：文本一模一样算一轮不变；
+                    #     仅长度不再增长也算，但要更保守（多等几轮），
+                    #     以免尾部重排 / 工具栏插入导致永远等不到逐字相等
+                    same_text = bool(normalized) and normalized == last_normalized
+                    same_len = bool(normalized) and len(normalized) == last_len
+                    if same_text or same_len:
                         stable_count += 1
-                        if stable_count >= STABLE_POLLS:
+                        threshold = STABLE_POLLS if same_text else LEN_STABLE_POLLS
+                        if stable_count >= threshold:
                             last_text = current_text
+                            if DEBUG:
+                                print(
+                                    f"[debug] poll={poll} 内容稳定 {stable_count} 次"
+                                    f"（same_text={same_text}），判定结束"
+                                )
                             break
                     else:
                         stable_count = 0
@@ -654,6 +724,13 @@ class DeepSeekWebDriver:
 
                     last_text = current_text
                     last_normalized = normalized
+                    last_len = len(normalized)
+                if DEBUG:
+                    print(
+                        f"[debug] poll={poll} nodes={len(responses)} len={len(normalized)} "
+                        f"stable={stable_count} generating={generating} saw={saw_generating} "
+                        f"before_len={len(before_text)}"
+                    )
 
                 # 总超时判定：若这期间其实已经读到实质回复，就直接返回已产生的内容，
                 # 绝不再把同一句 prompt 重发一遍（避免网页多出一轮、与 Pi 状态错位）
@@ -735,7 +812,7 @@ async def root():
     return {
         "service": "DeepSeek Web-to-API Bridge",
         "openai_compatible": True,
-        "endpoints": ["/v1/models", "/v1/chat/completions"],
+        "endpoints": ["/v1/models", "/v1/chat/completions", "/debug/dom"],
     }
 
 
@@ -747,6 +824,50 @@ async def list_models():
     return ModelListResponse(
         data=[ModelCard(id=m["id"]) for m in candidates.values()]
     )
+
+
+@app.get("/debug/dom", include_in_schema=False)
+async def debug_dom():
+    """诊断用：返回当前页面上「回复节点」与「疑似停止按钮控件」的真实结构。
+
+    用法：在 Pi 发起一轮对话、DeepSeek 正在生成时反复 curl 该端点，
+    即可看出两个结束判定信号（停止按钮 / 文本稳定）究竟有没有生效。
+    """
+    if driver.page is None:
+        raise HTTPException(status_code=503, detail="浏览器尚未初始化")
+
+    nodes = await driver.page.query_selector_all(RESPONSE_SELECTORS)
+    last_text = await nodes[-1].inner_text() if nodes else ""
+    node_summaries = []
+    for index, node in enumerate(nodes):
+        try:
+            node_text = await node.inner_text()
+        except Exception:
+            node_text = ""
+        try:
+            cls = await node.get_attribute("class") or ""
+        except Exception:
+            cls = ""
+        node_summaries.append({
+            "index": index,
+            "class": cls,
+            "text_length": len(node_text),
+            "sha1": hashlib.sha1(node_text.encode("utf-8")).hexdigest(),
+            "head": node_text[:80],
+        })
+    return {
+        "session_url": driver._current_session_url(),
+        "response_node_count": len(nodes),
+        "nodes": node_summaries,
+        "last_node": {
+            "text_length": len(last_text),
+            "sha1": hashlib.sha1(last_text.encode("utf-8")).hexdigest(),
+            "head": last_text[:200],
+            "tail": last_text[-200:],
+        },
+        "generating": await driver._page_is_generating(),
+        "stop_candidates": await driver.debug_stop_candidates(),
+    }
 
 
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
