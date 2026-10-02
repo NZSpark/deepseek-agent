@@ -8,6 +8,7 @@ import asyncio
 import json
 import re
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -29,6 +30,8 @@ class DeepSeekContextLimitError(RuntimeError):
 
 # 未指定任务标识时使用的会话桶（保持与历史行为一致：全局共用一条会话）
 DEFAULT_SESSION_KEY = "default"
+# DeepSeek 首页（新会话的入口）
+HOME_URL = "https://chat.deepseek.com/"
 
 
 @dataclass
@@ -88,6 +91,10 @@ class DeepSeekWebDriver:
         # 否则 build_prompt 只发增量会让模型收到一条没有前因的孤立消息。
         self._sessions: Dict[str, SessionState] = {}
         self._pages: Dict[str, Any] = {}
+        # 每个桶页面的最后一次使用时间（time.monotonic），用于空闲回收 / LRU 淘汰
+        self._page_last_used: Dict[str, float] = {}
+        # 按桶并发时的锁（PARALLEL_BUCKETS=true 才启用；默认桶始终用 self.lock）
+        self._locks: Dict[str, asyncio.Lock] = {}
 
     # ---------- 会话桶 ----------
     def _state(self, key: Optional[str] = None) -> SessionState:
@@ -106,8 +113,93 @@ class DeepSeekWebDriver:
             return self.page
         return self._pages.get(bucket)
 
+    def _lock_for(self, key: Optional[str] = None) -> asyncio.Lock:
+        """取某个会话桶的锁。
+
+        默认（``PARALLEL_BUCKETS=false``）所有桶共用 ``self.lock``，即**串行**：
+        分桶只是上下文隔离，不是并发能力。只有显式打开开关才会按桶各持一把锁。
+        """
+        bucket = key or DEFAULT_SESSION_KEY
+        if not config.PARALLEL_BUCKETS or bucket == DEFAULT_SESSION_KEY:
+            return self.lock
+        lock = self._locks.get(bucket)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[bucket] = lock
+        return lock
+
+    def _touch_page(self, key: Optional[str] = None) -> None:
+        self._page_last_used[key or DEFAULT_SESSION_KEY] = time.monotonic()
+
+    def _bucket_busy(self, bucket: str) -> bool:
+        """该桶是否正在生成回复（锁被持有）。用它代替额外的“活跃桶”标志。"""
+        return self._lock_for(bucket).locked()
+
+    async def _close_bucket_page(self, bucket: str, reason: str) -> bool:
+        """关闭某个会话桶的页面（**只关页面，状态保留**）。
+
+        返回是否真的关掉了一个页面。状态里的 ``url`` / ``turns`` 不动，
+        因此下次用到该桶时会重新打开同一个会话并按需播种上下文。
+        """
+        page = self._pages.pop(bucket, None)
+        self._page_last_used.pop(bucket, None)
+        if page is None:
+            return False
+        try:
+            await page.close()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[回收] 关闭 key={bucket} 的页面时出错（已忽略）：{exc}")
+        else:
+            print(f"[回收] 已关闭 key={bucket} 的页面（{reason}），会话状态保留。")
+        return True
+
+    async def _recycle_idle_pages(self, exclude: Optional[str] = None) -> int:
+        """关闭空闲超过 ``BUCKET_IDLE_TTL_S`` 的桶页面，返回关闭数量。"""
+        ttl = config.BUCKET_IDLE_TTL_S
+        if ttl <= 0:
+            return 0
+        now = time.monotonic()
+        closed = 0
+        for bucket in list(self._pages):
+            if bucket == exclude or self._bucket_busy(bucket):
+                continue
+            last_used = self._page_last_used.get(bucket, now)
+            if now - last_used > ttl:
+                closed += 1 if await self._close_bucket_page(bucket, f"空闲超过 {int(ttl)}s") else 0
+        return closed
+
+    async def _evict_lru_page(self, exclude: Optional[str] = None) -> bool:
+        """淘汰最久未用的桶页面（状态保留），腾出一个位置。
+
+        正在生成回复的桶与 ``exclude`` 永不淘汰：淘汰它们会直接中断正在进行的一轮对话。
+        """
+        candidates = [
+            bucket for bucket in self._pages
+            if bucket != exclude and not self._bucket_busy(bucket)
+        ]
+        if not candidates:
+            return False
+        oldest = min(candidates, key=lambda b: self._page_last_used.get(b, 0.0))
+        return await self._close_bucket_page(oldest, "超出会话桶上限，按 LRU 淘汰")
+
+    async def _wait_ready(self, page) -> bool:
+        """等页面的输入框就绪；超时只警告，不抛错（调用方还有自己的等待）。"""
+        try:
+            await page.wait_for_selector(
+                config.READY_SELECTOR, timeout=config.READY_TIMEOUT_MS, state="visible"
+            )
+            return True
+        except Exception:
+            print("[会话] 页面已打开，但未检测到输入框，请检查登录状态。")
+            return False
+
     async def _ensure_page(self, key: Optional[str]) -> None:
-        """为额外会话桶惰性创建页面并回到它上次的会话（如存在）。"""
+        """为额外会话桶惰性创建页面并回到它上次的会话（如存在）。
+
+        桶数量达到 ``MAX_SESSION_BUCKETS`` 时**不再直接报错**：先回收空闲页面，
+        再按 LRU 淘汰最久未用的页面（**只关页面、状态保留**，下次会自动重开同一会话
+        并按需播种）。只有显式把 ``MAX_SESSION_BUCKETS=0`` 设成“不允许额外桶”时才拒绝。
+        """
         bucket = key or DEFAULT_SESSION_KEY
         if bucket == DEFAULT_SESSION_KEY or bucket in self._pages:
             return
@@ -116,20 +208,32 @@ class DeepSeekWebDriver:
                 return
             if self.context is None:
                 raise RuntimeError("浏览器尚未初始化，无法创建新的会话页面。")
-            if len(self._pages) >= max(1, config.MAX_SESSION_BUCKETS):
+            limit = config.MAX_SESSION_BUCKETS
+            if limit <= 0:
                 raise RuntimeError(
-                    f"会话桶数量已达上限（{config.MAX_SESSION_BUCKETS}），"
-                    "请用 POST /session/reset 回收不再使用的会话。"
+                    "MAX_SESSION_BUCKETS=0 表示不允许额外的会话桶（所有请求共用默认会话）。"
+                    "如需按任务隔离，请把它设为 >=1；想彻底关闭分桶请用 SESSION_SCOPING=false。"
                 )
+            # 先回收空闲页面，仍不够就按 LRU 淘汰最久未用的（两者都不丢会话状态）
+            await self._recycle_idle_pages(exclude=bucket)
+            while len(self._pages) >= limit:
+                if not await self._evict_lru_page(exclude=bucket):
+                    raise RuntimeError(
+                        f"会话桶数量已达上限（{limit}），且当前没有可回收的页面"
+                        "（正在生成回复的会话不会被淘汰）。请稍后重试。"
+                    )
             page = await self.context.new_page()
             self._pages[bucket] = page
+            self._touch_page(bucket)
             state = self._state(bucket)
             # 回到该桶上次的会话；若上次已到顶则开新会话（首轮会播种）
-            target = "https://chat.deepseek.com/" if state.cap_hit else (
-                state.url or "https://chat.deepseek.com/"
-            )
+            target = HOME_URL if state.cap_hit else (state.url or HOME_URL)
             await page.goto(target, wait_until="domcontentloaded")
-            state.has_history = bool(state.url) and not state.cap_hit
+            await self._wait_ready(page)
+            # 只有页面确实停在某个会话上才算“有历史”，否则本轮必须播种
+            state.has_history = (
+                not state.cap_hit and self._current_session_url(bucket) is not None
+            )
         print(f"[会话] 已为 key={bucket} 创建独立会话页面（{target}）")
 
     # ---- 默认桶的状态：保留为属性，兼容既有调用与测试 ----
@@ -239,6 +343,7 @@ class DeepSeekWebDriver:
             target = saved_session or "https://chat.deepseek.com/"
 
         await self.page.goto(target, wait_until="domcontentloaded")
+        await self._wait_ready(self.page)
 
         if start_fresh:
             self.session_has_history = False
@@ -247,8 +352,16 @@ class DeepSeekWebDriver:
             self.session_cap_hit = False
             self._save_session_state(clear_url=True)
         else:
-            self.session_has_history = bool(saved_session)
-            if saved_session:
+            # 不要只看“文件里有 url”就当有历史：会话可能已被删除 / 被登出重定向。
+            # 以**页面真实落点**为准，判不出来就让本轮播种（宁多花一次上下文，不静默瞎答）。
+            landed = self._current_session_url()
+            self.session_has_history = landed is not None
+            if saved_session and landed is None:
+                print(
+                    "[会话] 保存的会话链接未能打开（可能已删除或未登录），"
+                    "本轮会重新播种上下文。"
+                )
+            elif saved_session:
                 print(f"\n[系统提示] 已恢复到上次的会话: {saved_session}")
         print("[系统提示] 服务启动成功！请确保 DeepSeek 页面保持登录状态。\n")
 
@@ -405,13 +518,8 @@ class DeepSeekWebDriver:
         page = self._page_for(key)
         if page is None:
             return
-        await page.goto("https://chat.deepseek.com/", wait_until="domcontentloaded")
-        try:
-            await page.wait_for_selector(
-                config.READY_SELECTOR, timeout=15000, state="visible"
-            )
-        except Exception:
-            print("[轮转] 新会话页面已打开，但未检测到输入框，请检查登录状态。")
+        await page.goto(HOME_URL, wait_until="domcontentloaded")
+        await self._wait_ready(page)
         state = self._state(key)
         state.has_history = False
         state.turns = 0
@@ -477,11 +585,7 @@ class DeepSeekWebDriver:
                 await page.reload(wait_until="domcontentloaded")
             else:
                 await page.goto(saved, wait_until="domcontentloaded")
-            try:
-                await page.wait_for_selector(
-                    config.READY_SELECTOR, timeout=15000, state="visible"
-                )
-            except Exception:
+            if not await self._wait_ready(page):
                 print("[恢复] 已打开会话，但未检测到输入框，请检查登录状态。")
                 return False
             print("[恢复] 已成功回到之前的会话。")
@@ -675,9 +779,11 @@ class DeepSeekWebDriver:
         bucket = key or DEFAULT_SESSION_KEY
         page = self._page_for(bucket)
         state = self._state(bucket)
-        async with self.lock:
+        # 默认所有桶共用 self.lock（串行）；只有 PARALLEL_BUCKETS=true 才按桶各持一把锁
+        async with self._lock_for(bucket):
             if page is None:
                 raise RuntimeError("浏览器尚未初始化：找不到可用于发送的会话页面。")
+            self._touch_page(bucket)  # 正在用的页面不会被空闲回收 / LRU 淘汰
             # 1. 定位并填入输入框
             chat_input = None
             for selector in config.INPUT_SELECTORS:
@@ -825,7 +931,8 @@ class DeepSeekWebDriver:
                     "下一轮将开启新会话并播种上下文。"
                 )
 
-            # 成功产生回复后，刷新保存的会话状态（可能刚创建了新会话）
+            # 成功产生回复后：刷新会话状态（可能刚创建了新会话）并续期页面使用时间
+            self._touch_page(bucket)
             await self._remember_session(bucket)
             return last_text, extracted_blocks
 
@@ -841,6 +948,10 @@ class DeepSeekWebDriver:
             "c": "c", "bash": "sh", "shell": "sh", "sql": "sql", "markdown": "md"
         }
 
+        # 同一秒内的多个请求会拿到同样的 timestamp，必须再加一段随机后缀，
+        # 否则 code_<ts>_1.py / response_<ts>.md 会互相覆盖（多任务并行后很常见）
+        unique = uuid.uuid4().hex[:6]
+
         if code_blocks:
             for idx, block in enumerate(code_blocks, start=1):
                 lang = block["lang"].lower().strip()
@@ -848,7 +959,7 @@ class DeepSeekWebDriver:
                 ext = ext_map.get(lang, "py" if "import " in code or "def " in code else "txt")
 
                 timestamp = int(time.time())
-                filename = f"code_{timestamp}_{idx}.{ext}"
+                filename = f"code_{timestamp}_{idx}_{unique}.{ext}"
                 filepath = Path(output_dir) / filename
 
                 with open(filepath, "w", encoding="utf-8") as f:
@@ -856,7 +967,7 @@ class DeepSeekWebDriver:
                 saved.append(str(filepath))
                 print(f"[已保存文件] {filepath}")
         else:
-            filename = f"response_{int(time.time())}.md"
+            filename = f"response_{int(time.time())}_{unique}.md"
             filepath = Path(output_dir) / filename
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(raw_text)

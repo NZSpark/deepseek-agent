@@ -24,11 +24,31 @@ from deepseek_web.driver import DeepSeekContextLimitError, DeepSeekTimeoutError 
 TOOL_REPLY = '```tool_call\n{"name": "bash", "arguments": {"command": "ls"}}\n```'
 
 
+class FakeNode:
+    def __init__(self, text, cls="ds-markdown"):
+        self._text = text
+        self._cls = cls
+
+    async def inner_text(self):
+        return self._text
+
+    async def get_attribute(self, name):
+        return self._cls if name == "class" else None
+
+
+class FakePage:
+    def __init__(self, texts=("机密正文：用户的完整对话内容",)):
+        self.texts = list(texts)
+
+    async def query_selector_all(self, selector):
+        return [FakeNode(t) for t in self.texts]
+
+
 class FakeDriver:
     """只实现路由会用到的那部分 driver 接口。"""
 
     def __init__(self, reply="完成", error=None, browser_ready=True):
-        self.page = object() if browser_ready else None
+        self.page = FakePage() if browser_ready else None
         self.init_error = None if browser_ready else "登录页未就绪"
         self.reply = reply
         self.error = error
@@ -52,6 +72,12 @@ class FakeDriver:
 
     def session_keys(self):
         return ["default"]
+
+    async def _page_is_generating(self, key=None):
+        return False
+
+    async def debug_stop_candidates(self, key=None):
+        return []
 
     def reset_session(self, key=None):
         self.resets.append(key)
@@ -109,6 +135,46 @@ class ValidationTests(RouteTestCase):
         # 这里把当前行为钉住，避免以后误以为它在走 400 分支。
         payload = self.body(self.call(self.request(messages=[{"role": "system", "content": "x"}])))
         self.assertEqual(payload["choices"][0]["finish_reason"], "stop")
+
+
+class EmptyPromptTests(RouteTestCase):
+    def test_empty_effective_prompt_is_a_400(self):
+        # 真正要发出去的那份 prompt 为空时必须立刻报错，而不是发一条空消息
+        # （空输入会让网页版什么都不做，客户端只能等到超时）
+        with unittest.mock.patch.object(server, "build_prompt", return_value=""):
+            response = self.call(self.request())
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.body(response)["error"]["type"], "invalid_request_error")
+        self.assertEqual(self.fake.chats, [])
+
+    def test_non_empty_prompt_still_reaches_the_driver(self):
+        self.assertEqual(self.call(self.request()).choices[0].finish_reason, "stop")
+        self.assertEqual(len(self.fake.chats), 1)
+
+
+class DebugDomTests(RouteTestCase):
+    def test_hidden_by_default(self):
+        with unittest.mock.patch.object(config, "DEBUG", False):
+            with self.assertRaises(server.HTTPException) as ctx:
+                asyncio.run(server.debug_dom())
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_enabled_under_debug(self):
+        with unittest.mock.patch.object(config, "DEBUG", True):
+            response = asyncio.run(server.debug_dom())
+        payload = response
+        self.assertEqual(payload["response_node_count"], 1)
+        self.assertIn("sha1", payload["last_node"])
+        self.assertEqual(payload["last_node"]["text_length"], len("机密正文：用户的完整对话内容"))
+
+    def test_never_echoes_message_bodies(self):
+        with unittest.mock.patch.object(config, "DEBUG", True):
+            payload = asyncio.run(server.debug_dom())
+        self.assertNotIn("head", payload["last_node"])
+        self.assertNotIn("tail", payload["last_node"])
+        self.assertNotIn("head", payload["nodes"][0])
+        # 整份响应里不得出现正文片段
+        self.assertNotIn("机密正文", json.dumps(payload, ensure_ascii=False))
 
 
 class ErrorMappingTests(RouteTestCase):

@@ -31,6 +31,9 @@ python -m unittest discover -s tests -t . -v
 
 ```bash
 curl -s localhost:8000/healthz | python -m json.tool          # 就绪状态 + 各会话桶进度
-curl -s localhost:8000/debug/dom | python -m json.tool        # 真实 DOM：回复节点 / 疑似停止按钮
 curl -X POST "localhost:8000/session/reset?session=my-task"   # 重置某个任务的会话（仍会播种历史）
+
+# /debug/dom 默认返回 404，需要 DEEPSEEK_DEBUG=1 启动；它只回 sha1 / 长度，不含正文
+DEEPSEEK_DEBUG=1 python deepseek_api_server.py
+curl -s localhost:8000/debug/dom | python -m json.tool
 ```

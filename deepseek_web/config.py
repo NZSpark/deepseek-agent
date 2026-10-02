@@ -130,7 +130,17 @@ SESSION_KEY_HEADER = env_str("SESSION_KEY_HEADER", "X-DeepSeek-Session")
 SESSION_SCOPING = env_bool("SESSION_SCOPING", True)
 # 单个 key 的长度上限（防止超长头部变成文件名/JSON 键）
 SESSION_KEY_MAX_LEN = env_int("SESSION_KEY_MAX_LEN", 64)
+# 同时在用的会话桶数量上限。超出时**回收最久未用**的页面（状态保留，下次按 URL 恢复）。
+# 0 表示不允许额外会话桶（所有请求都走默认桶）；想彻底关闭分桶用 SESSION_SCOPING=false。
 MAX_SESSION_BUCKETS = env_int("MAX_SESSION_BUCKETS", 8)
+# 空闲页面的回收间隔（秒）：超过这个时间没被用过的桶页面会被关闭（0 = 不按空闲回收）。
+# 页面关掉不等于丢上下文：状态里的 url / turns 仍在，下次会重新打开并决定是否播种。
+BUCKET_IDLE_TTL_S = env_float("BUCKET_IDLE_TTL_S", 900)
+# 是否允许**按桶并发**（每个会话桶一把锁）。默认 false = 所有桶串行（更安全）。
+# 打开后会同时驱动多个网页会话，可能触发风控，请自行评估。
+PARALLEL_BUCKETS = env_bool("PARALLEL_BUCKETS")
+# 新建/恢复页面后等待输入框就绪的超时（毫秒）
+READY_TIMEOUT_MS = env_int("READY_TIMEOUT_MS", 15000)
 # 播种（新会话时重放历史）的最大字符数预算；超出时保留最近的消息
 SEED_MAX_CHARS = env_int("SEED_MAX_CHARS", 12000)
 # 网页会话超过以下任一阈值后，下一轮自动轮转到新会话（0 表示禁用该维度）

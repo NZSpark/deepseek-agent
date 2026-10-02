@@ -8,6 +8,8 @@
 import asyncio
 import json
 import sys
+import tempfile
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -32,6 +34,8 @@ class FakePage:
         self.url = url
         self.gotos = []
         self.keyboard = self
+        self.closed = False
+        self.ready_waits = 0
 
     async def goto(self, url, **kwargs):
         self.gotos.append(url)
@@ -41,18 +45,31 @@ class FakePage:
         self.gotos.append("__reload__")
 
     async def wait_for_selector(self, selector, timeout=0, **kwargs):
+        self.ready_waits += 1
         return FakeInput()
+
+    async def close(self):
+        self.closed = True
 
     async def press(self, key):
         return None
 
 
+class HomeRedirectPage(FakePage):
+    """goto 之后并不是停在目标会话上（会话被删 / 被登出重定向）。"""
+
+    async def goto(self, url, **kwargs):
+        self.gotos.append(url)
+        self.url = "https://chat.deepseek.com/"
+
+
 class FakeContext:
-    def __init__(self):
+    def __init__(self, page_factory=None):
         self.pages = []
+        self.page_factory = page_factory or FakePage
 
     async def new_page(self):
-        page = FakePage()
+        page = self.page_factory()
         self.pages.append(page)
         return page
 
@@ -166,18 +183,161 @@ class BucketPageTests(BucketTestCase):
         asyncio.run(driver._ensure_page("task-a"))
         self.assertEqual(len(driver.context.pages), 1)
 
-    def test_bucket_limit_is_enforced(self):
+    def test_page_creation_waits_for_the_input_box(self):
         driver = self.driver_for()
-        with unittest.mock.patch.object(config, "MAX_SESSION_BUCKETS", 1):
-            asyncio.run(driver._ensure_page("task-a"))
-            with self.assertRaises(RuntimeError):
-                asyncio.run(driver._ensure_page("task-b"))
+        asyncio.run(driver._ensure_page("task-a"))
+        self.assertEqual(driver._page_for("task-a").ready_waits, 1)
 
     def test_send_chat_requires_browser_context_for_extra_bucket(self):
         driver = self.driver_for()
         driver.context = None
         with self.assertRaises(RuntimeError):
             asyncio.run(driver.send_chat("go", key="task-a"))
+
+
+class BucketEvictionTests(BucketTestCase):
+    """桶页面回收（P1-A）：达上限时不再永久失败，而是 LRU 淘汰 / 空闲回收。"""
+
+    def test_limit_evicts_lru_page_and_keeps_state(self):
+        driver = self.driver_for()
+        with unittest.mock.patch.object(config, "MAX_SESSION_BUCKETS", 1):
+            driver._state("task-a").url = URL_A
+            driver._state("task-a").turns = 3
+            asyncio.run(driver._ensure_page("task-a"))
+            page_a = driver._page_for("task-a")
+            asyncio.run(driver._ensure_page("task-b"))  # 不应报错，而是腾位置
+
+        self.assertIsNone(driver._page_for("task-a"))
+        self.assertTrue(page_a.closed)
+        self.assertIsNotNone(driver._page_for("task-b"))
+        # 只关页面、状态保留：下次用 task-a 会回到同一个会话
+        self.assertEqual(driver._state("task-a").turns, 3)
+        self.assertEqual(driver._state("task-a").url, URL_A)
+
+    def test_evicted_bucket_reopens_the_same_session_without_seeding(self):
+        driver = self.driver_for()
+        with unittest.mock.patch.object(config, "MAX_SESSION_BUCKETS", 1):
+            driver._state("task-a").url = URL_A
+            asyncio.run(driver._ensure_page("task-a"))
+            asyncio.run(driver._ensure_page("task-b"))
+            asyncio.run(driver._ensure_page("task-a"))
+
+        page = driver._page_for("task-a")
+        self.assertEqual(page.gotos, [URL_A])
+        self.assertFalse(driver.needs_seed("task-a"))
+
+    def test_idle_pages_are_recycled(self):
+        driver = self.driver_for()
+        driver._state("task-a").url = URL_A
+        asyncio.run(driver._ensure_page("task-a"))
+        page_a = driver._page_for("task-a")
+        driver._page_last_used["task-a"] = time.monotonic() - 10_000
+        with unittest.mock.patch.object(config, "BUCKET_IDLE_TTL_S", 60):
+            closed = asyncio.run(driver._recycle_idle_pages())
+        self.assertEqual(closed, 1)
+        self.assertTrue(page_a.closed)
+        self.assertIsNone(driver._page_for("task-a"))
+        self.assertEqual(driver._state("task-a").url, URL_A)
+
+    def test_idle_recycle_can_be_disabled(self):
+        driver = self.driver_for()
+        asyncio.run(driver._ensure_page("task-a"))
+        driver._page_last_used["task-a"] = time.monotonic() - 10_000
+        with unittest.mock.patch.object(config, "BUCKET_IDLE_TTL_S", 0):
+            self.assertEqual(asyncio.run(driver._recycle_idle_pages()), 0)
+        self.assertIsNotNone(driver._page_for("task-a"))
+
+    def test_busy_bucket_is_never_recycled_or_evicted(self):
+        driver = self.driver_for()
+        asyncio.run(driver._ensure_page("task-a"))
+        driver._page_last_used["task-a"] = time.monotonic() - 10_000
+
+        async def hold():
+            async with driver._lock_for("task-a"):
+                return await driver._recycle_idle_pages()
+
+        with unittest.mock.patch.object(config, "BUCKET_IDLE_TTL_S", 60):
+            self.assertEqual(asyncio.run(hold()), 0)
+        self.assertIsNotNone(driver._page_for("task-a"))
+
+    def test_no_evictable_page_raises_with_honest_message(self):
+        driver = self.driver_for()
+        with unittest.mock.patch.object(config, "MAX_SESSION_BUCKETS", 1):
+            asyncio.run(driver._ensure_page("task-a"))
+
+            async def hold():
+                async with driver._lock_for("task-a"):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        await driver._ensure_page("task-b")
+                    return str(ctx.exception)
+
+            message = asyncio.run(hold())
+        # 提示必须指向真实可行的出路，不能再说“用 /session/reset 回收”
+        self.assertIn("请稍后重试", message)
+        self.assertNotIn("/session/reset", message)
+
+    def test_zero_limit_is_rejected_with_actionable_message(self):
+        driver = self.driver_for()
+        with unittest.mock.patch.object(config, "MAX_SESSION_BUCKETS", 0):
+            with self.assertRaises(RuntimeError) as ctx:
+                asyncio.run(driver._ensure_page("task-a"))
+        message = str(ctx.exception)
+        self.assertIn("MAX_SESSION_BUCKETS=0", message)
+        self.assertIn("SESSION_SCOPING=false", message)
+
+
+class LandingCheckTests(BucketTestCase):
+    """goto 之后必须反查真实落点（P1-B）：落在首页就不能当作“有历史”。"""
+
+    def test_redirected_bucket_needs_seed(self):
+        driver = self.driver_for()
+        driver.context = FakeContext(page_factory=HomeRedirectPage)
+        driver._state("task-a").url = URL_A
+        asyncio.run(driver._ensure_page("task-a"))
+        self.assertTrue(driver.needs_seed("task-a"))
+
+    def test_real_session_url_counts_as_history(self):
+        driver = self.driver_for()
+        driver.context = FakeContext()
+        driver._state("task-a").url = URL_A
+        asyncio.run(driver._ensure_page("task-a"))
+        self.assertFalse(driver.needs_seed("task-a"))
+
+    def test_startup_with_dead_session_url_requires_seed(self):
+        self._tmp.write_text(
+            json.dumps({"url": URL_A, "turns": 5, "est_tokens": 500}), encoding="utf-8"
+        )
+        driver = self.driver_for(HomeRedirectPage())
+        asyncio.run(driver._restore_session_on_startup())
+        self.assertTrue(driver.needs_seed())
+
+    def test_startup_with_live_session_url_reuses_history(self):
+        self._tmp.write_text(
+            json.dumps({"url": URL_A, "turns": 5, "est_tokens": 500}), encoding="utf-8"
+        )
+        driver = self.driver_for(FakePage(url=URL_A))
+        asyncio.run(driver._restore_session_on_startup())
+        self.assertFalse(driver.needs_seed())
+        self.assertEqual(driver.session_turns, 5)
+
+
+class LockTests(BucketTestCase):
+    """分桶 ≠ 并发（P1-C）：默认串行，只有显式开关才按桶各持一把锁。"""
+
+    def test_serial_by_default(self):
+        driver = self.driver_for()
+        self.assertIs(driver._lock_for(), driver.lock)
+        self.assertIs(driver._lock_for("task-a"), driver.lock)
+        self.assertIs(driver._lock_for("task-b"), driver.lock)
+
+    def test_parallel_buckets_get_their_own_locks(self):
+        driver = self.driver_for()
+        with unittest.mock.patch.object(config, "PARALLEL_BUCKETS", True):
+            lock_a = driver._lock_for("task-a")
+            self.assertIsNot(lock_a, driver.lock)
+            self.assertIsNot(lock_a, driver._lock_for("task-b"))
+            self.assertIs(lock_a, driver._lock_for("task-a"))  # 缓存的同一把
+            self.assertIs(driver._lock_for(), driver.lock)      # 默认桶仍用全局锁
 
 
 class ResetTests(BucketTestCase):
@@ -221,6 +381,26 @@ class ResetTests(BucketTestCase):
         driver = self.driver_for()
         driver.reset_session("never-used")
         self.assertTrue(driver._state("never-used").pending_rotation)
+
+
+class SaveFilesTests(unittest.TestCase):
+    """落盘文件名去重（P2-E）：同一秒内的两个请求不能互相覆盖。"""
+
+    def test_same_second_requests_do_not_overwrite(self):
+        blocks = [{"lang": "python", "code": "print(1)"}]
+        with tempfile.TemporaryDirectory() as out:
+            first = srv.DeepSeekWebDriver.save_extracted_files("回复 A", blocks, out)
+            second = srv.DeepSeekWebDriver.save_extracted_files("回复 B", blocks, out)
+            self.assertNotEqual(first, second)
+            for path in first + second:
+                self.assertTrue(Path(path).exists())
+
+    def test_plain_text_replies_also_get_unique_names(self):
+        with tempfile.TemporaryDirectory() as out:
+            first = srv.DeepSeekWebDriver.save_extracted_files("A", [], out)
+            second = srv.DeepSeekWebDriver.save_extracted_files("B", [], out)
+        self.assertNotEqual(first, second)
+        self.assertTrue(first[0].endswith(".md"))
 
 
 class SessionKeyResolutionTests(BucketTestCase):

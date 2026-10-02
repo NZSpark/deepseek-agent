@@ -145,11 +145,19 @@ async def list_models():
 
 @app.get("/debug/dom", include_in_schema=False)
 async def debug_dom():
-    """诊断用：返回当前页面上「回复节点」与「疑似停止按钮控件」的真实结构。
+    """诊断用：返回当前页面「回复节点」与「疑似停止按钮控件」的结构（**不含正文**）。
+
+    默认关闭（返回 404）：它会把会话的节点数量 / 长度 / 哈希暴露出去，
+    属于信息泄露面。需要用 `DEEPSEEK_DEBUG=1` 启动才启用。
 
     用法：在 Pi 发起一轮对话、DeepSeek 正在生成时反复 curl 该端点，
     即可看出两个结束判定信号（停止按钮 / 文本稳定）究竟有没有生效。
     """
+    if not config.DEBUG:
+        raise HTTPException(
+            status_code=404,
+            detail="调试端点默认关闭；请用 DEEPSEEK_DEBUG=1 启动服务。",
+        )
     if driver.page is None:
         raise HTTPException(status_code=503, detail="浏览器尚未初始化")
 
@@ -170,8 +178,9 @@ async def debug_dom():
             "class": cls,
             "text_length": len(node_text),
             "sha1": hashlib.sha1(node_text.encode("utf-8")).hexdigest(),
-            "head": node_text[:80],
         })
+    # 注意：**不回显正文**。判断“结束判定是否生效”只需要长度与 sha1
+    # （生成中变化、结束后稳定），所以这里不再输出 head / tail。
     return {
         "session_url": driver._current_session_url(),
         "response_node_count": len(nodes),
@@ -179,8 +188,6 @@ async def debug_dom():
         "last_node": {
             "text_length": len(last_text),
             "sha1": hashlib.sha1(last_text.encode("utf-8")).hexdigest(),
-            "head": last_text[:200],
-            "tail": last_text[-200:],
         },
         "generating": await driver._page_is_generating(),
         "stop_candidates": await driver.debug_stop_candidates(),
@@ -213,14 +220,15 @@ async def chat_completions(
         seed=True,
         seed_max_chars=config.SEED_MAX_CHARS,
     )
-    if not delta_prompt and not seeded_prompt:
-        return _error_response(400, "需要包含至少一条 user / tool 消息", "invalid_request_error")
-
     # 按任务隔离会话：同一 X-DeepSeek-Session 取值的请求共用一条网页会话
     session_key = _session_key(request, x_deepseek_session)
 
     # 仅用于 usage 估算；真正的选型在 driver.send_chat 内部
     prompt = seeded_prompt if driver.needs_seed(session_key) else delta_prompt
+    # 真正要发的那份是空的就直接报错。不能拖到发出去再等：
+    # 空输入会让网页版什么都不做，客户端只能等到 180s 超时，很难排查。
+    if not prompt:
+        return _error_response(400, "需要包含至少一条 user / tool 消息", "invalid_request_error")
 
     # ---------- 流式分支（Pi 默认 stream=true）----------
     if request.stream:

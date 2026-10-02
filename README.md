@@ -9,7 +9,7 @@
 ## ✨ 特性
 
 - **OpenAI 兼容接口**：完整实现 `/v1/models` 与 `/v1/chat/completions`，支持 `messages`、`tools`、`stream` 等标准字段；错误也以 OpenAI 兼容的 `error` 结构返回。
-- **可运维**：`GET /healthz` 健康检查、`HEADLESS` 无头模式、`/debug/dom` DOM 诊断端点。
+- **可运维**：`GET /healthz` 健康检查、`HEADLESS` 无头模式、`/debug/dom` DOM 诊断端点（需 `DEEPSEEK_DEBUG=1`，且不回显正文）。
 - **会话生命周期**：自动识别网页版「对话长度上限」（不再伪装成超时），超预算时自动轮转到新会话，并**播种**已有上下文。
 - **流式响应（SSE）**：以 `text/event-stream` 逐字吐出内容，兼容 OpenAI 流式解析器。
 - **模拟 Function Calling**：网页版本身不支持 function calling，本项目通过「提示词注入 + 结构化解析」模拟出 OpenAI 的 `tool_calls` 语义。
@@ -207,7 +207,7 @@ DeepSeek 网页版不支持原生 function calling，本项目采用三步模拟
 - **重试**：只有「等待超时」才会重试，最多 `DEEPSEEK_RETRIES` 次（默认 2），每次先尝试恢复会话再退避重试；找不到输入框、profile 被占用等属于不可重试，直接返回错误。
 - **无头运行**：已登录过之后可用 `HEADLESS=1` 启动（适合 CI / 无显示环境）；首次登录必须有头模式。
 - **健康检查**：`GET /healthz` 返回浏览器是否就绪、当前会话地址、会话状态（`session`）、在用会话桶（`session_keys`）与初始化错误，便于客户端探活。
-- **诊断**：`DEEPSEEK_DEBUG=1` 启动后，每轮轮询都会打印节点数 / 文本长度 / 稳定计数 / 生成状态，可直接看出结束判定是否生效；`GET /debug/dom` 会返回页面上真实的回复节点（含 class / 长度 / sha1）与疑似停止按钮控件结构。
+- **诊断**：`DEEPSEEK_DEBUG=1` 启动后，每轮轮询都会打印节点数 / 文本长度 / 稳定计数 / 生成状态，可直接看出结束判定是否生效。`GET /debug/dom` 会返回回复节点的 class / 长度 / sha1 与疑似停止按钮控件结构 —— **不包含任何正文**，且只在 `DEEPSEEK_DEBUG=1` 时才注册（否则返回 404）。
 - **流式语义**：不带 `tools` 时边生成边吐字；带 `tools` 时必须先缓冲完整回复才能判断是不是 `tool_calls`，因此调用方在生成期间只会收到 `: keep-alive` 注释，随后一次性收到内容或 tool_calls。
 - **会话生命周期**（重要）：服务默认**复用同一个网页会话**，因此模型看到的是累积上下文，与客户端的 `contextWindow` 无关。为了不让它无限增长：
   - 超过 `SESSION_MAX_TURNS` / `SESSION_MAX_TOKENS`（默认 60 轮 / 6 万估算 token）时，下一轮自动**轮转**到新会话；
@@ -215,7 +215,9 @@ DeepSeek 网页版不支持原生 function calling，本项目采用三步模拟
   - 网页版到顶时会弹出提示并停止响应，服务会识别它并返回 `context_length_exceeded`，而不是死等到超时；重试阶梯的**最后一级**就是“换新会话 + 重放历史”；
   - 想手动换一个干净会话：`POST /session/reset`、设 `DEEPSEEK_NEW_SESSION=true` 后重启，或删除 `user_data/.deepseek_session`；
   - 想知道当前会话涨到哪了：看 `GET /healthz` 的 `session` 字段（`turns` / `est_tokens` / `cap_hit` / `pending_rotation`）。
-- **按任务隔离会话**：默认所有请求共用一条网页会话。若同时跑多个任务（例如多个 Pi 会话），给每个任务带一个 `X-DeepSeek-Session: <任务 id>` 请求头，服务会为每个 id 维护独立的网页会话与页面（上限 `MAX_SESSION_BUCKETS`，默认 8）；状态存在 `user_data/.deepseek_session` 里，默认会话仍在文件顶层、其余在 `sessions` 下。
+- **按任务隔离会话**：默认所有请求共用一条网页会话。若同时跑多个任务（例如多个 Pi 会话），给每个任务带一个 `X-DeepSeek-Session: <任务 id>` 请求头，服务会为每个 id 维护独立的网页会话与页面；状态存在 `user_data/.deepseek_session` 里，默认会话仍在文件顶层、其余在 `sessions` 下。
+  - **桶页面上限**：`MAX_SESSION_BUCKETS`（默认 8）。超出时不会报错，而是关闭**最久未用**的那条页面（`BUCKET_IDLE_TTL_S` 秒内没有任何请求的页面也会被关掉）。被关掉不等于丢上下文：会话状态还在，下次用到时会重新打开同一个会话并按需播种。设 `0` 表示不允许额外桶（一律走默认会话）。
+  - ⚠️ **分桶 ≠ 并发**：默认所有桶共用一把锁，请求仍然**串行**执行（分桶只提供上下文隔离）。确实需要并行时设 `PARALLEL_BUCKETS=true` 按桶加锁，但这会同时驱动多个网页会话，**可能触发风控**，请自行评估。
 - **代码落盘**：当回复中包含代码块时，会从 DOM 提取并按语言保存；若无代码块则保存完整回复为 `.md`。
 - **不要提交 `user_data/`**：其中包含登录 Cookie / Session，属于敏感数据。
 - **不要绑定 `0.0.0.0`**：服务默认只监听 `127.0.0.1`，因为转发的是你的登录会话，暴露到网络等于把账号交出去。
@@ -228,13 +230,15 @@ DeepSeek 网页版不支持原生 function calling，本项目采用三步模拟
 .venv/bin/python -m unittest discover -s tests -t . -v
 ```
 
-共 128 个用例，覆盖解析层、结束判定、会话生命周期（播种 / 到顶 / 轮转 / 重试阶梯 / 会话桶）、模块结构与路由层。全部用假 page / 假 driver 驱动，不需要启动浏览器，也不需要额外依赖（只用标准库 unittest）。
+共 149 个用例，覆盖解析层、结束判定、会话生命周期（播种 / 到顶 / 轮转 / 重试阶梯 / 会话桶 / 页面回收 / 锁）、模块结构与路由层。全部用假 page / 假 driver 驱动，不需要启动浏览器，也不需要额外依赖（只用标准库 unittest）。
 
 ---
 
 ## 🧩 在 Pi Coding Agent 中接入
 
 在 Pi 的配置文件中新增一个 provider，指向本地服务即可：
+
+pi --provider deepseek-web --model deepseek-chat
 
 建议给每个 Agent 任务带一个固定的 `X-DeepSeek-Session` 请求头（或让客户端填 `user` 字段），这样多个任务各自持有独立会话，不会互相污染上下文。
 
