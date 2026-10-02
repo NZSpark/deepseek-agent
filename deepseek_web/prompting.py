@@ -135,6 +135,7 @@ def build_prompt(
     tool_choice: Optional[Any] = None,
     seed: bool = False,
     seed_max_chars: Optional[int] = None,
+    task_block: Optional[str] = None,
 ) -> str:
     """把客户端发来的完整 OpenAI 消息数组，转换成要发给网页输入框的文本。
 
@@ -142,12 +143,17 @@ def build_prompt(
       只发送“最后一条 assistant 消息之后”的新增消息（新的 user 指令或 tool 结果）。
     * ``seed=True``：当前会话是**新开的**，必须把既有上下文一次性播种进去，
       否则模型会收到一条没有前因的孤立消息。
+    * ``task_block``：任务快照（见 ``tasks.resume_block``）。仅在 ``seed=True`` 时
+      生效，会被放在**历史之前、上下文重建头之后**，因此**不会**被
+      ``seed_max_chars`` 的尾部截断逻辑丢掉——这是“轮转不丢任务”的关键。
     """
     if seed:
         systems, kept, truncated = _seed_messages(messages, seed_max_chars or DEFAULT_SEED_MAX_CHARS)
         parts: List[str] = [
             "[上下文重建] 这是一个新会话。以下是本次任务此前的对话记录，请据此继续，不要从头重做。"
         ]
+        if task_block:
+            parts.append(task_block)
         if truncated:
             parts.append("（更早的部分因长度限制已省略，如需可向我确认。）")
         parts.extend(_render_message(m) for m in systems + kept)

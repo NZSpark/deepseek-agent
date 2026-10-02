@@ -22,8 +22,10 @@ from .driver import (
     DeepSeekContextLimitError,
     DeepSeekTimeoutError,
 )
+from .driver import DEFAULT_SESSION_KEY
 from .models import ChatCompletionRequest, ChatMessage, ToolCall
 from .prompting import build_prompt, estimate_tokens
+from . import tasks
 from .toolcalls import _tool_names, parse_tool_calls
 
 
@@ -257,6 +259,11 @@ async def run_chat(
 
     与 server.py 的 chat 路径共用 driver / prompting / toolcalls，但不改其代码。
     """
+    # 任务快照：记录本轮 messages，轮转播种时用它续接任务（不丢任务目标）。
+    bucket = session_key or DEFAULT_SESSION_KEY
+    tasks.record(bucket, request.messages)
+    task_block = tasks.resume_block(bucket)
+
     delta_prompt = build_prompt(request.messages, request.tools, request.tool_choice)
     seeded_prompt = build_prompt(
         request.messages,
@@ -264,6 +271,7 @@ async def run_chat(
         request.tool_choice,
         seed=True,
         seed_max_chars=config.SEED_MAX_CHARS,
+        task_block=task_block,
     )
     prompt = seeded_prompt if driver.needs_seed(session_key) else delta_prompt
     if not prompt:

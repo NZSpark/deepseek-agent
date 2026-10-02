@@ -12,7 +12,7 @@
 入口仍为项目根目录的 ``deepseek_api_server.py``（薄封装，向后兼容）。
 """
 
-from . import config
+from . import config, tasks
 from .driver import (
     DEFAULT_SESSION_KEY,
     DeepSeekContextLimitError,
@@ -27,6 +27,7 @@ from .toolcalls import parse_tool_calls, to_tool_call_models
 
 __all__ = [
     "config",
+    "tasks",
     "ChatCompletionRequest",
     "ChatCompletionResponse",
     "ChatMessage",

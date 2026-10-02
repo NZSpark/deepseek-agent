@@ -29,6 +29,7 @@ from .models import (
 )
 from .prompting import build_prompt, estimate_tokens
 from .responses import ResponsesRequest, handle_responses
+from . import tasks
 from .streaming import _stream_chat_completion
 from .toolcalls import _tool_names, parse_tool_calls, to_tool_call_models
 
@@ -280,6 +281,16 @@ async def chat_completions(
             "unavailable",
         )
 
+    # 按任务隔离会话：同一客户端 / 同一 X-DeepSeek-Session 取值的请求共用一条网页会话
+    session_key = _session_key(request, x_deepseek_session, user_agent)
+    if config.DEBUG:
+        print(f"[debug] session_key={session_key!r}")
+
+    # 任务快照：记录本轮 messages，供轮转播种时续接任务（不丢任务目标）。
+    bucket = session_key or DEFAULT_SESSION_KEY
+    tasks.record(bucket, request.messages)
+    task_block = tasks.resume_block(bucket)
+
     # 两份文本：增量版（现有会话已有上下文）与播种版（新会话 / 轮转后需要重放历史）。
     # 到底用哪份由 driver 决定（只有它知道当前网页会话是否还有历史）。
     delta_prompt = build_prompt(request.messages, request.tools, request.tool_choice)
@@ -289,11 +300,8 @@ async def chat_completions(
         request.tool_choice,
         seed=True,
         seed_max_chars=config.SEED_MAX_CHARS,
+        task_block=task_block,
     )
-    # 按任务隔离会话：同一客户端 / 同一 X-DeepSeek-Session 取值的请求共用一条网页会话
-    session_key = _session_key(request, x_deepseek_session, user_agent)
-    if config.DEBUG:
-        print(f"[debug] session_key={session_key!r}")
 
     # 预判：会话没有历史时 driver 会用“播种”prompt。仅用于下面的空输入快速失败；
     # 真正发出去的那份（以及 usage）以 driver.sent_prompt(session_key) 为准。

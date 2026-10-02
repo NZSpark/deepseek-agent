@@ -168,6 +168,19 @@ RESPONSES_KEEPALIVE_S = env_float("RESPONSES_KEEPALIVE_S", 10.0)
 RESPONSES_TOOL_BUFFER = env_bool("RESPONSES_TOOL_BUFFER", True)
 
 
+# ==================== 任务快照（轮转后续接任务）====================
+# 是否启用任务快照：每个会话桶在 user_data/.deepseek_tasks/ 下维护一份轻量任务状态
+# （任务目标 + 最近进展）。网页会话轮转播种时优先注入它，确保任务目标不被
+# SEED_MAX_CHARS 截断，从而“不丢任务”。关闭后回到纯历史播种的旧行为。
+TASK_SNAPSHOT_ENABLED = env_bool("TASK_SNAPSHOT_ENABLED", True)
+# 任务快照存放目录。
+TASK_FILE_DIR = env_str("TASK_FILE_DIR", "./user_data/.deepseek_tasks")
+# 任务目标（第一条 user 消息）保留的最大字符数；超出截断。
+TASK_GOAL_MAX_CHARS = env_int("TASK_GOAL_MAX_CHARS", 2000)
+# 快照里滚动保留的最近消息条数（用于“最近进展”）。
+TASK_KEEP_MESSAGES = env_int("TASK_KEEP_MESSAGES", 8)
+
+
 # ==================== DOM 选择器 ====================
 # 统一集中在这里，网页版改版时只需改这一处（也可用 .env 覆盖而无需改代码）。
 # 回复节点的候选选择器
