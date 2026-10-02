@@ -156,6 +156,18 @@ SESSION_MAX_TURNS = env_int("SESSION_MAX_TURNS", 60)
 SESSION_MAX_TOKENS = env_int("SESSION_MAX_TOKENS", 60000)
 
 
+# ==================== Responses API（Codex CLI）====================
+# 是否启用 /v1/responses 路由。默认开启；关闭后该端点返回 404，
+# 且 /v1/chat/completions（Pi）完全不受影响。
+ENABLE_RESPONSES_API = env_bool("ENABLE_RESPONSES_API", True)
+# 流式生成期间发送 keep-alive 注释的间隔（秒）；0 = 关闭。
+# 网页版生成慢，Codex 侧 stream_idle_timeout_ms 较大时用它保活连接。
+RESPONSES_KEEPALIVE_S = env_float("RESPONSES_KEEPALIVE_S", 10.0)
+# 工具模式下：是否先缓冲整段回复再判断 tool_calls（true = 需要缓冲，
+# 因为要等完整文本才能解析出 function_call；false = 直接透传文本增量）。
+RESPONSES_TOOL_BUFFER = env_bool("RESPONSES_TOOL_BUFFER", True)
+
+
 # ==================== DOM 选择器 ====================
 # 统一集中在这里，网页版改版时只需改这一处（也可用 .env 覆盖而无需改代码）。
 # 回复节点的候选选择器

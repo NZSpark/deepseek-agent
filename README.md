@@ -1,14 +1,14 @@
 # DeepSeek Web-to-API Bridge
 
-把 **DeepSeek 网页版（chat.deepseek.com）** 包装成一个 **OpenAI 兼容的本地 API 服务**，让任何支持 OpenAI 协议的客户端（Pi Coding Agent、OpenAI SDK、LangChain、Cline 等）都能直接使用 DeepSeek 网页版的能力——包括 **流式输出** 和 **function calling（工具调用）**。
+把 **DeepSeek 网页版（chat.deepseek.com）** 包装成一个 **OpenAI 兼容的本地 API 服务**，让任何支持 OpenAI 协议的客户端（Pi Coding Agent、OpenAI Codex CLI、OpenAI SDK、LangChain、Cline 等）都能直接使用 DeepSeek 网页版的能力——包括 **流式输出** 和 **function calling（工具调用）**。
 
-> 本项目通过 Playwright 驱动一个真实的 Chromium 浏览器，复用本地登录态，把网页对话“桥接”成标准 `/v1/chat/completions` 接口。无需官方 API Key。
+> 本项目通过 Playwright 驱动一个真实的 Chromium 浏览器，复用本地登录态，把网页对话“桥接”成标准 `/v1/chat/completions`（Chat Completions）与 `/v1/responses`（Responses API，供 Codex CLI 使用）接口。无需官方 API Key。
 
 ---
 
 ## ✨ 特性
 
-- **OpenAI 兼容接口**：完整实现 `/v1/models` 与 `/v1/chat/completions`，支持 `messages`、`tools`、`stream` 等标准字段；错误也以 OpenAI 兼容的 `error` 结构返回。
+- **OpenAI 兼容接口**：完整实现 `/v1/models`、`/v1/chat/completions`，并额外提供 `/v1/responses`（OpenAI Responses API，供 **Codex CLI** 使用）；支持 `messages`、`tools`、`stream` 等标准字段；错误也以 OpenAI 兼容的 `error` 结构返回。
 - **可运维**：`GET /healthz` 健康检查、`HEADLESS` 无头模式、`/debug/dom` DOM 诊断端点（需 `DEEPSEEK_DEBUG=1`，且不回显正文）。
 - **会话生命周期**：自动识别网页版「对话长度上限」（不再伪装成超时），超预算时自动轮转到新会话，并**播种**已有上下文。
 - **流式响应（SSE）**：以 `text/event-stream` 逐字吐出内容，兼容 OpenAI 流式解析器。
@@ -31,7 +31,8 @@
 │   ├── toolcalls.py         #   工具注入与解析（模拟 function calling）
 │   ├── prompting.py         #   消息数组 -> 网页输入框文本
 │   ├── driver.py            #   Playwright 浏览器 Driver + 会话持久化
-│   ├── streaming.py         #   SSE 流式编码
+│   ├── streaming.py         #   SSE 流式编码（Chat Completions）
+│   ├── responses.py         #   Responses API 兼容层（Codex CLI 专用，命名 SSE 事件）
 │   └── server.py            #   FastAPI 应用与路由
 ├── client_test.py           # 使用官方 openai SDK 测试本地服务的示例客户端
 ├── requirements.txt         # 运行时依赖（含 client_test.py 需要的 openai）
@@ -169,6 +170,21 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 也可用请求体的 `user` 字段代替该请求头。请求头名可用 `.env` 的 `SESSION_KEY_HEADER` 改名，`SESSION_SCOPING=false` 可整体关闭分桶。
 
+### `POST /v1/responses`（Responses API · Codex CLI）
+
+OpenAI **Responses API** 兼容端点，专供 **OpenAI Codex CLI**（其 `wire_api = "responses"`）调用。请求/响应与 `/v1/chat/completions` 共用同一套 driver、会话分桶与工具解析，仅做协议转换。
+
+- 请求：`input`（字符串或 item 数组）、`instructions`、`tools`、`stream` 等；未知字段宽松接收（不报 422）。
+- 非流式响应：`object=response`、`status=completed`、`output[].content[].text`、`usage.input_tokens/output_tokens/total_tokens`。
+- 流式响应：**命名 SSE 事件**（`event: response.output_text.delta` 等），每个 data 载荷自带 `type` 字段与单调递增的 `sequence_number`；工具调用走 `response.function_call_arguments.delta/.done`。
+- 可用 `.env` 的 `ENABLE_RESPONSES_API=false` 关闭本端点（返回 404），不影响 chat 路径。
+
+```bash
+curl http://127.0.0.1:8000/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-chat","input":"Reply with exactly: OK"}'
+```
+
 ### `POST /session/reset`
 
 **本地扩展**，手动逃生口：让指定会话的下一轮开新会话（历史会照旧**播种**回来，不丢上下文）。
@@ -229,6 +245,7 @@ DeepSeek 网页版不支持原生 function calling，本项目采用三步模拟
     ```
 
     这样 3 个 Agent 会各自驱动一条网页会话、**真正并行**，互不阻塞；上下文与 usage 都按桶隔离。`BUCKET_LOCK_TIMEOUT_S>0` 时，若有请求落到**已被占用的同一个桶**（例如客户端重试堆叠），它会快速返回 503 `upstream_busy` 而不是无限排队、拖到客户端自己超时；设 `0` 则一直等待（旧行为）。用 `GET /healthz` 的 `cluster` 字段可看到 `parallel` / `max_buckets` / `busy`（正在处理的桶）/ `open_pages`。
+- **Responses API（Codex）**：`/v1/responses` 默认启用，可用 `ENABLE_RESPONSES_API=false` 关闭（返回 404，不影响 chat）。`RESPONSES_KEEPALIVE_S` 控制流式 keep-alive 间隔（秒，0=关闭）；`RESPONSES_TOOL_BUFFER` 控制工具模式是否先缓冲整段回复再解析 `tool_calls`（默认 `true`）。
 - **代码落盘**：当回复中包含代码块时，会从 DOM 提取并按语言保存；若无代码块则保存完整回复为 `.md`。
 - **不要提交 `user_data/`**：其中包含登录 Cookie / Session，属于敏感数据。
 - **不要绑定 `0.0.0.0`**：服务默认只监听 `127.0.0.1`，因为转发的是你的登录会话，暴露到网络等于把账号交出去。
@@ -241,7 +258,75 @@ DeepSeek 网页版不支持原生 function calling，本项目采用三步模拟
 .venv/bin/python -m unittest discover -s tests -t . -v
 ```
 
-共 149 个用例，覆盖解析层、结束判定、会话生命周期（播种 / 到顶 / 轮转 / 重试阶梯 / 会话桶 / 页面回收 / 锁）、模块结构与路由层。全部用假 page / 假 driver 驱动，不需要启动浏览器，也不需要额外依赖（只用标准库 unittest）。
+共 176 个用例，覆盖解析层、结束判定、会话生命周期（播种 / 到顶 / 轮转 / 重试阶梯 / 会话桶 / 页面回收 / 锁）、模块结构、路由层，以及 **Responses API 兼容层**（请求映射 / 响应结构 / 命名 SSE 事件 / 工具调用 / 错误映射）。全部用假 page / 假 driver 驱动，不需要启动浏览器，也不需要额外依赖（只用标准库 unittest）。
+
+---
+
+## 🤖 在 OpenAI Codex CLI 中接入
+
+Codex CLI 只发送 `POST /v1/responses`（Responses API），本项目已提供兼容端点。
+
+### 1. 配置 `~/.codex/config.toml`
+
+```toml
+model = "deepseek-chat"
+model_provider = "deepseekbridge"
+# 流式抗断：网页版生成慢，建议调大
+request_max_retries = 6
+stream_max_retries = 8
+stream_idle_timeout_ms = 600000
+
+[model_providers.deepseekbridge]
+name = "deepseekbridge / DeepSeek Web Bridge"
+base_url = "http://127.0.0.1:8000/v1"   # 本项目监听地址
+wire_api = "responses"                  # 必须；chat 已移除
+env_key = "DEEPSEEK_BRIDGE_KEY"         # 本项目免 Key，填占位值即可
+```
+
+> ⚠️ `model_provider` / `model_providers` **只在用户级 `~/.codex/config.toml` 生效**，项目级 `.codex/config.toml` 会被忽略并告警。
+
+### 2. 环境变量（占位即可）
+
+```bash
+export DEEPSEEK_BRIDGE_KEY="none"   # 本项目不做鉴权，仅满足 Codex 的 env_key 校验
+```
+
+### 3. 启动服务并冒烟
+
+```bash
+python deepseek_api_server.py
+codex exec --skip-git-repo-check "Reply with exactly: OK"
+```
+
+### 4. 写权限与 `git push`
+
+Codex 默认沙箱为只读且禁网，`git push` 需要联网，需显式放行：
+
+```bash
+# 方式一：完全放开（最省事）
+codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check "your prompt"
+
+# 方式二：工作区可写 + 显式开网（推荐）
+codex exec --sandbox workspace-write \
+  -c sandbox_workspace_write.network_access=true \
+  --ask-for-approval on-request "your prompt"
+```
+
+或写进 `~/.codex/config.toml` 常驻生效：
+
+```toml
+approval_policy = "on-request"
+sandbox_mode    = "workspace-write"
+
+[sandbox_workspace_write]
+network_access = true
+```
+
+| 项 | 说明 |
+| --- | --- |
+| `git push` 需要网络 | `workspace-write` 默认禁网，必须 `network_access=true` 或 `danger-full-access` |
+| `.git` 保护 | `workspace-write` 下 `.git/` 只读，但普通 `git add/commit/push` 不受影响 |
+| 凭据 | `git push` 用本机 git 凭据（SSH key / token），Codex 只代你跑命令 |
 
 ---
 

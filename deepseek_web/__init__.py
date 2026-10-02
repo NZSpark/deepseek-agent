@@ -22,6 +22,7 @@ from .driver import (
 )
 from .models import ChatCompletionRequest, ChatCompletionResponse, ChatMessage
 from .prompting import build_prompt, estimate_tokens
+from .responses import ResponsesRequest, handle_responses
 from .toolcalls import parse_tool_calls, to_tool_call_models
 
 __all__ = [
@@ -38,4 +39,6 @@ __all__ = [
     "estimate_tokens",
     "parse_tool_calls",
     "to_tool_call_models",
+    "ResponsesRequest",
+    "handle_responses",
 ]

@@ -28,6 +28,7 @@ from .models import (
     Usage,
 )
 from .prompting import build_prompt, estimate_tokens
+from .responses import ResponsesRequest, handle_responses
 from .streaming import _stream_chat_completion
 from .toolcalls import _tool_names, parse_tool_calls, to_tool_call_models
 
@@ -174,6 +175,7 @@ async def root():
         "endpoints": [
             "/v1/models",
             "/v1/chat/completions",
+            "/v1/responses",
             "/healthz",
             "/debug/dom",
             "/session/reset",
@@ -189,6 +191,25 @@ async def list_models():
     return ModelListResponse(
         data=[ModelCard(id=m["id"]) for m in candidates.values()]
     )
+
+
+@app.post("/v1/responses")
+async def responses(
+    request: ResponsesRequest,
+    x_deepseek_session: Optional[str] = Header(None, alias=config.SESSION_KEY_HEADER),
+    user_agent: Optional[str] = Header(None, alias="User-Agent"),
+):
+    """OpenAI Responses API（Codex CLI 专用）。
+
+    复用 /v1/chat/completions 的会话分桶与 driver；具体转换与响应构造在
+    ``deepseek_web.responses``。此路由绝不改动 chat 路径的行为。
+    """
+    if not config.ENABLE_RESPONSES_API:
+        raise HTTPException(status_code=404, detail="Responses API 未启用（ENABLE_RESPONSES_API=false）")
+    session_key = _session_key(request, x_deepseek_session, user_agent)
+    if config.DEBUG:
+        print(f"[debug] responses session_key={session_key!r}")
+    return await handle_responses(request, session_key, driver)
 
 
 @app.get("/debug/dom", include_in_schema=False)
