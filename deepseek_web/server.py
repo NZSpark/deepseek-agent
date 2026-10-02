@@ -62,11 +62,54 @@ def _error_response(status_code: int, message: str, err_type: str):
 app = FastAPI(title="DeepSeek Web-to-API Bridge", lifespan=lifespan)
 
 
-def _session_key(request: ChatCompletionRequest, header_value: Optional[str]) -> Optional[str]:
+def _client_from_ua(ua: str) -> Optional[str]:
+    """从 User-Agent 中提取客户端标识，用于自动按客户端分桶。
+
+    不同的 AI 编程助手（Cline、Cursor、Aider 等）会发送各自独有的 User-Agent，
+    例如 ``cline/3.2.1``、``cursor/0.48``。提取出名字部分即可作为桶标识，
+    使不同客户端自动隔离到不同的 DeepSeek 会话，无需手动配置。
+
+    返回值带 ``ua:`` 前缀，与显式传入的 session key 区分开，避免冲突。
+    """
+    # FastAPI 直接调用（单元测试）时，未被注入的 Header 默认值是 Header 对象而非 str，
+    # 这里做类型防御，保证只接受真正的字符串 UA。
+    if not isinstance(ua, str) or not ua:
+        return None
+    ua_lower = ua.lower()
+    # 常见 AI 编程助手 / SDK 的关键词。用**词边界**匹配，避免子串误命中
+    # （例如 "continue" 出现在别的 UA 里、"openai" 被 python SDK 泛化命中）。
+    _KNOWN_CLIENTS = (
+        "roo-code", "windsurf", "cline", "cursor", "aider",
+        "copilot", "continue", "antigravity", "openai", "anthropic",
+    )
+    for name in _KNOWN_CLIENTS:
+        if re.search(rf"(?:^|[^a-z0-9]){re.escape(name)}(?:[/\s;]|$)", ua_lower):
+            return f"ua:{name}"
+    # 通用 fallback：取 UA 第一个 token 的 product 部分
+    # e.g. "python-httpx/0.27.0" → "ua:python-httpx"
+    first_token = ua.split()[0] if ua else ""
+    if "/" in first_token:
+        product = first_token.split("/", 1)[0].strip().lower()
+        # 只接受形如合法产品名的短串，避免把奇怪 UA 变成非法桶名
+        if re.fullmatch(r"[a-z0-9._-]{1,32}", product):
+            return f"ua:{product}"
+    return None
+
+
+def _session_key(
+    request: ChatCompletionRequest,
+    header_value: Optional[str],
+    user_agent: Optional[str] = None,
+) -> Optional[str]:
     """确定本次请求属于哪个会话桶（按任务隔离会话）。
 
-    优先用 ``X-DeepSeek-Session`` 请求头（可用 ``SESSION_KEY_HEADER`` 改名），
-    其次退回 OpenAI 的 ``user`` 字段；都没有则返回 None（默认桶，全局共用）。
+    优先级（高 → 低）：
+
+    1. ``X-DeepSeek-Session`` 请求头（可用 ``SESSION_KEY_HEADER`` 改名）；
+    2. OpenAI 的 ``user`` 字段；
+    3. **自动识别**：从 ``User-Agent`` 提取客户端名称，使不同客户端自动隔离。
+
+    前两者都没有、且 User-Agent 也无法识别时返回 None（默认桶，全局共用）。
     取值会被消毒（只保留 ``[\\w.\\-:]``）并限长，避免变成非法文件名 / 超长 JSON 键。
     """
     if not config.SESSION_SCOPING:
@@ -76,6 +119,9 @@ def _session_key(request: ChatCompletionRequest, header_value: Optional[str]) ->
         user = getattr(request, "user", None)
         raw = user if isinstance(user, str) else ""
     raw = raw.strip()
+    if not raw and config.SESSION_SCOPING_BY_UA:
+        # 自动按 User-Agent 分桶：不同客户端自动隔离到不同会话（可由参数关闭）
+        raw = _client_from_ua(user_agent or "") or ""
     if not raw:
         return None
     sanitized = re.sub(r"[^\w.\-:]", "_", raw)[: max(1, config.SESSION_KEY_MAX_LEN)]
@@ -200,6 +246,7 @@ async def debug_dom():
 async def chat_completions(
     request: ChatCompletionRequest,
     x_deepseek_session: Optional[str] = Header(None, alias=config.SESSION_KEY_HEADER),
+    user_agent: Optional[str] = Header(None, alias="User-Agent"),
 ):
     if not request.messages:
         return _error_response(400, "messages 不能为空", "invalid_request_error")
@@ -222,8 +269,10 @@ async def chat_completions(
         seed=True,
         seed_max_chars=config.SEED_MAX_CHARS,
     )
-    # 按任务隔离会话：同一 X-DeepSeek-Session 取值的请求共用一条网页会话
-    session_key = _session_key(request, x_deepseek_session)
+    # 按任务隔离会话：同一客户端 / 同一 X-DeepSeek-Session 取值的请求共用一条网页会话
+    session_key = _session_key(request, x_deepseek_session, user_agent)
+    if config.DEBUG:
+        print(f"[debug] session_key={session_key!r}")
 
     # 预判：会话没有历史时 driver 会用“播种”prompt。仅用于下面的空输入快速失败；
     # 真正发出去的那份（以及 usage）以 driver.sent_prompt(session_key) 为准。

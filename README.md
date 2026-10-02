@@ -262,7 +262,7 @@ pi --provider deepseek-web --model deepseek-chat
       "apiKey": "none",
       "compat": { "supportsDeveloperRole": false, "supportsReasoningEffort": false },
       "models": [
-        { "id": "deepseek-chat", "name": "DeepSeek Chat (Web)", "input": ["text"], "contextWindow": 65536, "maxTokens": 8192 }
+        { "id": "deepseek-chat", "name": "DeepSeek Chat (Web)", "input": ["text"], "contextWindow": 256000, "maxTokens": 65535 }
       ]
     }
   }

@@ -520,6 +520,42 @@ class SessionKeyResolutionTests(BucketTestCase):
         with unittest.mock.patch.object(config, "SESSION_SCOPING", False):
             self.assertIsNone(_session_key(self.request(), "task-a"))
 
+    def test_ua_is_used_when_header_and_user_missing(self):
+        from deepseek_web.server import _session_key
+
+        # 默认 SESSION_SCOPING_BY_UA=True：无 header / user 时按 UA 自动分桶
+        self.assertEqual(
+            _session_key(self.request(), None, "cline/3.2.1"), "ua:cline"
+        )
+        self.assertEqual(
+            _session_key(self.request(), None, "python-httpx/0.27.0"), "ua:python-httpx"
+        )
+
+    def test_header_and_user_still_win_over_ua(self):
+        from deepseek_web.server import _session_key
+
+        self.assertEqual(
+            _session_key(self.request(user="body"), "header", "cline/3.2"), "header"
+        )
+        self.assertEqual(
+            _session_key(self.request(user="pi-1"), None, "cline/3.2"), "pi-1"
+        )
+
+    def test_ua_scoping_can_be_disabled(self):
+        from deepseek_web.server import _session_key
+
+        with unittest.mock.patch.object(config, "SESSION_SCOPING_BY_UA", False):
+            self.assertIsNone(_session_key(self.request(), None, "cline/3.2.1"))
+
+    def test_ua_match_respects_word_boundaries(self):
+        from deepseek_web.server import _client_from_ua
+
+        # 不应因子串命中已知客户端；无词边界时退回通用 product
+        self.assertEqual(_client_from_ua("MyContinueBot/1.0"), "ua:mycontinuebot")
+        self.assertEqual(_client_from_ua("openai-python/1.2"), "ua:openai-python")
+        self.assertEqual(_client_from_ua("Cline/3.2 (darwin)"), "ua:cline")
+        self.assertEqual(_client_from_ua(""), None)
+
 
 if __name__ == "__main__":
     unittest.main()

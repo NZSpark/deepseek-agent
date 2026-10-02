@@ -128,6 +128,10 @@ CAP_CHECK_EVERY = env_int("CAP_CHECK_EVERY", 4)
 SESSION_KEY_HEADER = env_str("SESSION_KEY_HEADER", "X-DeepSeek-Session")
 # 关闭后所有请求共用默认会话（旧行为）
 SESSION_SCOPING = env_bool("SESSION_SCOPING", True)
+# 当请求头与 user 字段都缺失时，是否允许**按 User-Agent 自动分桶**（不同客户端自动隔离）。
+# 默认开：不同 AI 编程助手自动各用一条 DeepSeek 会话。关闭后退回旧的「默认桶，全局共用」行为。
+# 注意：自动分桶会使桶数随客户端数量增长，实际受 MAX_SESSION_BUCKETS 约束（超出按 LRU 回收页面，状态保留）。
+SESSION_SCOPING_BY_UA = env_bool("SESSION_SCOPING_BY_UA", True)
 # 单个 key 的长度上限（防止超长头部变成文件名/JSON 键）
 SESSION_KEY_MAX_LEN = env_int("SESSION_KEY_MAX_LEN", 64)
 # 同时在用的会话桶数量上限。超出时**回收最久未用**的页面（状态保留，下次按 URL 恢复）。
