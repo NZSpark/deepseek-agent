@@ -19,7 +19,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import deepseek_api_server as srv  # noqa: E402
 from deepseek_web import config, server  # noqa: E402
-from deepseek_web.driver import DeepSeekContextLimitError, DeepSeekTimeoutError  # noqa: E402
+from deepseek_web.driver import (  # noqa: E402
+    DeepSeekBusyError,
+    DeepSeekContextLimitError,
+    DeepSeekTimeoutError,
+)
 
 TOOL_REPLY = '```tool_call\n{"name": "bash", "arguments": {"command": "ls"}}\n```'
 
@@ -52,6 +56,9 @@ class FakeDriver:
         self.init_error = None if browser_ready else "登录页未就绪"
         self.reply = reply
         self.error = error
+        # 真实 driver 会在 send_chat 内记录“实际发出的那份 prompt”（可能因轮转
+        # 由增量改选播种版，且按会话桶隔离）。这里同样设置，供 usage 估算与回归测试。
+        self.last_prompt = None
         self.chats = []
         self.seed_queries = []
         self.resets = []
@@ -66,9 +73,20 @@ class FakeDriver:
 
     async def send_chat(self, prompt, on_delta=None, seeded_prompt=None, key=None):
         self.chats.append({"prompt": prompt, "key": key, "seeded": seeded_prompt})
+        # 模拟真实 driver：实际发出的 prompt 以 driver 记录为准（按桶读取）
+        self.last_prompt = prompt
         if self.error is not None:
             raise self.error
         return self.reply, []
+
+    def sent_prompt(self, key=None):
+        return self.last_prompt
+
+    def busy_keys(self):
+        return []
+
+    def cluster_stats(self):
+        return {"parallel": True, "max_buckets": 3, "busy": [], "keys": ["default"]}
 
     def session_keys(self):
         return ["default"]
@@ -196,6 +214,13 @@ class ErrorMappingTests(RouteTestCase):
         self.assertEqual(response.status_code, 502)
         self.assertEqual(self.body(response)["error"]["type"], "upstream_error")
 
+    def test_busy_session_maps_to_503(self):
+        # 同一会话桶等锁超时：本地排队保护，不是上游故障 -> 503 upstream_busy
+        self.fake.error = DeepSeekBusyError("会话桶 pi-task-1 正在处理另一个请求")
+        response = self.call(self.request())
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(self.body(response)["error"]["type"], "upstream_busy")
+
 
 class SessionKeyTests(RouteTestCase):
     def test_header_key_is_forwarded_to_driver(self):
@@ -228,6 +253,23 @@ class CompletionShapeTests(RouteTestCase):
         self.assertEqual(payload["choices"][0]["finish_reason"], "stop")
         self.assertEqual(payload["choices"][0]["message"]["content"], "完成")
         self.assertGreater(payload["usage"]["total_tokens"], 0)
+
+    def test_usage_uses_prompt_actually_sent(self):
+        # usage.prompt_tokens 必须按 driver 实际发出的 prompt 估算，而不是调用方
+        # 预判的那份（driver 可能因轮转把增量换成播种版）。
+        baseline = self.body(self.call(self.request()))["usage"]["prompt_tokens"]
+
+        # 让 driver 在 send_chat 内记录一份明显更长的“实发”prompt，
+        # 模拟“调用方预估发增量、driver 实际发了播种版”的场景。
+        async def long_send_chat(prompt, on_delta=None, seeded_prompt=None, key=None):
+            self.fake.last_prompt = "上下文 " * 500
+            return self.fake.reply, []
+
+        original = self.fake.send_chat
+        self.fake.send_chat = long_send_chat
+        self.addCleanup(setattr, self.fake, "send_chat", original)
+        inflated = self.body(self.call(self.request()))["usage"]["prompt_tokens"]
+        self.assertGreater(inflated, baseline)
 
     def test_tool_reply_becomes_tool_calls(self):
         self.fake.reply = TOOL_REPLY
@@ -301,6 +343,9 @@ class HealthzTests(RouteTestCase):
         self.assertTrue(payload["browser_ready"])
         self.assertEqual(payload["session_keys"], ["default"])
         self.assertTrue(payload["session_scoping"])
+        # 多 Agent 观测：cluster 必须回报并发开关与桶上限
+        self.assertTrue(payload["cluster"]["parallel"])
+        self.assertEqual(payload["cluster"]["max_buckets"], 3)
 
     def test_healthz_degrades_when_browser_is_missing(self):
         self.fake.page = None

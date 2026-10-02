@@ -139,6 +139,10 @@ BUCKET_IDLE_TTL_S = env_float("BUCKET_IDLE_TTL_S", 900)
 # 是否允许**按桶并发**（每个会话桶一把锁）。默认 false = 所有桶串行（更安全）。
 # 打开后会同时驱动多个网页会话，可能触发风控，请自行评估。
 PARALLEL_BUCKETS = env_bool("PARALLEL_BUCKETS")
+# 等待某个会话桶锁的最长时间（秒）：0 = 一直等（默认，保持旧行为）。
+# >0 时，若同一会话桶已有请求在跑（同一 key 并发/重试堆叠），超过该时间就快速失败，
+# 返回「上游繁忙」而不是无限排队、拖到客户端自己超时。不同桶互不影响。
+BUCKET_LOCK_TIMEOUT_S = env_float("BUCKET_LOCK_TIMEOUT_S", 0)
 # 新建/恢复页面后等待输入框就绪的超时（毫秒）
 READY_TIMEOUT_MS = env_int("READY_TIMEOUT_MS", 15000)
 # 播种（新会话时重放历史）的最大字符数预算；超出时保留最近的消息

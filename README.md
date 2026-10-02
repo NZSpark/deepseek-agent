@@ -136,6 +136,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 | 400 | `context_length_exceeded` | 网页会话已达上下文上限（正常会自动轮转，仍失败时才返回） |
 | 502 | `upstream_error` | 上游浏览器不可用 / 找不到输入框 |
 | 503 | `unavailable` | 浏览器尚未就绪（未登录或 profile 被占用） |
+| 503 | `upstream_busy` | 同一会话桶已有请求在跑，等锁超过 `BUCKET_LOCK_TIMEOUT_S`（只在该值 >0 时出现） |
 | 504 | `timeout` | 等待网页版回复超时（已按重试阶梯重试过） |
 | 500 | `server_error` | 其他未预期错误 |
 
@@ -218,6 +219,16 @@ DeepSeek 网页版不支持原生 function calling，本项目采用三步模拟
 - **按任务隔离会话**：默认所有请求共用一条网页会话。若同时跑多个任务（例如多个 Pi 会话），给每个任务带一个 `X-DeepSeek-Session: <任务 id>` 请求头，服务会为每个 id 维护独立的网页会话与页面；状态存在 `user_data/.deepseek_session` 里，默认会话仍在文件顶层、其余在 `sessions` 下。
   - **桶页面上限**：`MAX_SESSION_BUCKETS`（默认 8）。超出时不会报错，而是关闭**最久未用**的那条页面（`BUCKET_IDLE_TTL_S` 秒内没有任何请求的页面也会被关掉）。被关掉不等于丢上下文：会话状态还在，下次用到时会重新打开同一个会话并按需播种。设 `0` 表示不允许额外桶（一律走默认会话）。
   - ⚠️ **分桶 ≠ 并发**：默认所有桶共用一把锁，请求仍然**串行**执行（分桶只提供上下文隔离）。确实需要并行时设 `PARALLEL_BUCKETS=true` 按桶加锁，但这会同时驱动多个网页会话，**可能触发风控**，请自行评估。
+  - **多 Agent 同时访问**：给每个 Agent 一个独立的会话标识，并打开并发。推荐配置：
+
+    ```
+    SESSION_SCOPING=true
+    PARALLEL_BUCKETS=true
+    MAX_SESSION_BUCKETS=3          # >= 同时访问的 Agent 数
+    BUCKET_LOCK_TIMEOUT_S=15       # 同一会话桶排队上限（秒）；0 = 一直等
+    ```
+
+    这样 3 个 Agent 会各自驱动一条网页会话、**真正并行**，互不阻塞；上下文与 usage 都按桶隔离。`BUCKET_LOCK_TIMEOUT_S>0` 时，若有请求落到**已被占用的同一个桶**（例如客户端重试堆叠），它会快速返回 503 `upstream_busy` 而不是无限排队、拖到客户端自己超时；设 `0` 则一直等待（旧行为）。用 `GET /healthz` 的 `cluster` 字段可看到 `parallel` / `max_buckets` / `busy`（正在处理的桶）/ `open_pages`。
 - **代码落盘**：当回复中包含代码块时，会从 DOM 提取并按语言保存；若无代码块则保存完整回复为 `.md`。
 - **不要提交 `user_data/`**：其中包含登录 Cookie / Session，属于敏感数据。
 - **不要绑定 `0.0.0.0`**：服务默认只监听 `127.0.0.1`，因为转发的是你的登录会话，暴露到网络等于把账号交出去。

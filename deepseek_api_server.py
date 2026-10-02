@@ -87,6 +87,7 @@ from deepseek_web.prompting import (  # noqa: F401
 # ---- Driver / 流式 / 路由 ----
 from deepseek_web.driver import (  # noqa: F401
     DEFAULT_SESSION_KEY,
+    DeepSeekBusyError,
     DeepSeekContextLimitError,
     DeepSeekTimeoutError,
     DeepSeekWebDriver,

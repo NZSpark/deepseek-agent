@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import deepseek_api_server as srv  # noqa: E402
 from deepseek_web import config  # noqa: E402
-from deepseek_web.driver import DEFAULT_SESSION_KEY  # noqa: E402
+from deepseek_web.driver import DEFAULT_SESSION_KEY, DeepSeekBusyError  # noqa: E402
 
 URL_A = "https://chat.deepseek.com/a/chat/s/aaaaaaaa-1111-2222-3333-444444444444"
 URL_A2 = "https://chat.deepseek.com/a/chat/s/bbbbbbbb-5555-6666-7777-888888888888"
@@ -86,6 +86,9 @@ class BucketTestCase(unittest.TestCase):
             unittest.mock.patch.object(config, "SESSION_MAX_TURNS", 0),
             unittest.mock.patch.object(config, "SESSION_MAX_TOKENS", 0),
             unittest.mock.patch.object(config, "SESSION_SCOPING", True),
+            # 固定并发相关配置，避免依赖开发机上的 .env 取值
+            unittest.mock.patch.object(config, "PARALLEL_BUCKETS", False),
+            unittest.mock.patch.object(config, "BUCKET_LOCK_TIMEOUT_S", 0),
         ]
         for patch in self._patches:
             patch.start()
@@ -338,6 +341,81 @@ class LockTests(BucketTestCase):
             self.assertIsNot(lock_a, driver._lock_for("task-b"))
             self.assertIs(lock_a, driver._lock_for("task-a"))  # 缓存的同一把
             self.assertIs(driver._lock_for(), driver.lock)      # 默认桶仍用全局锁
+
+
+class SentPromptIsolationTests(BucketTestCase):
+    """并发多 Agent：实发 prompt 必须按桶隔离，usage 不能串台。"""
+
+    @staticmethod
+    def _stub_send(driver):
+        async def fake(prompt, on_delta=None, key=None):
+            return "答案", []
+
+        driver._send_chat_locked = fake
+
+    def test_prompts_are_tracked_per_bucket(self):
+        driver = self.driver_for()
+        self._stub_send(driver)
+        asyncio.run(driver.send_chat("A", seeded_prompt="SEED-A", key="agent-a"))
+        asyncio.run(driver.send_chat("B", seeded_prompt="SEED-B", key="agent-b"))
+        # 两个新桶都会播种，各记各的，互不覆盖
+        self.assertEqual(driver.sent_prompt("agent-a"), "SEED-A")
+        self.assertEqual(driver.sent_prompt("agent-b"), "SEED-B")
+        # 默认桶没发过，不能拿到别人的
+        self.assertIsNone(driver.sent_prompt())
+
+
+class BusyLockTests(BucketTestCase):
+    """同一会话桶锁的等待上限（BUCKET_LOCK_TIMEOUT_S）：超时快速失败，不无限排队。"""
+
+    def test_same_bucket_second_request_fails_fast(self):
+        driver = self.driver_for()
+        driver._pages["agent-a"] = FakePage()  # 已有页面，send_chat 不会去建页
+
+        async def scenario():
+            with unittest.mock.patch.object(config, "PARALLEL_BUCKETS", True), \
+                 unittest.mock.patch.object(config, "BUCKET_LOCK_TIMEOUT_S", 0.05):
+                busy = driver._lock_for("agent-a")
+                await busy.acquire()  # 模拟 agent-a 正在生成
+                try:
+                    with self.assertRaises(DeepSeekBusyError):
+                        await driver.send_chat("X", seeded_prompt="SEED", key="agent-a")
+                finally:
+                    busy.release()
+                # 等锁超时不能把锁泄漏掉：释放后必须可用
+                self.assertFalse(busy.locked())
+
+        asyncio.run(scenario())
+
+    def test_wait_is_unlimited_by_default(self):
+        driver = self.driver_for()
+        self.assertEqual(driver.cluster_stats()["bucket_lock_timeout_s"], 0)
+
+
+class ClusterStatsTests(BucketTestCase):
+    """多 Agent 运维观测：/healthz 的 cluster 字段内容。"""
+
+    def test_reports_parallel_and_bucket_usage(self):
+        driver = self.driver_for()
+        driver._state("agent-a")  # 触发一个会话桶
+        with unittest.mock.patch.object(config, "PARALLEL_BUCKETS", True), \
+             unittest.mock.patch.object(config, "MAX_SESSION_BUCKETS", 3):
+            stats = driver.cluster_stats()
+        self.assertTrue(stats["parallel"])
+        self.assertEqual(stats["max_buckets"], 3)
+        self.assertIn("agent-a", stats["keys"])
+        self.assertEqual(stats["busy"], [])
+
+    def test_busy_keys_tracks_the_active_bucket(self):
+        driver = self.driver_for()
+
+        async def scenario():
+            with unittest.mock.patch.object(config, "PARALLEL_BUCKETS", True):
+                async with driver._session_lock("agent-a"):
+                    self.assertEqual(driver.busy_keys(), ["agent-a"])
+
+        asyncio.run(scenario())
+        self.assertEqual(driver.busy_keys(), [])  # 释放后不再算忙
 
 
 class ResetTests(BucketTestCase):

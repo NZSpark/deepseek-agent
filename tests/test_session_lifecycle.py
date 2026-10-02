@@ -99,6 +99,9 @@ class SessionTestCase(unittest.TestCase):
             unittest.mock.patch.object(config, "CAP_CHECK_EVERY", 1),
             unittest.mock.patch.object(config, "SESSION_MAX_TURNS", 0),
             unittest.mock.patch.object(config, "SESSION_MAX_TOKENS", 0),
+            # 固定并发相关配置，避免依赖开发机上的 .env 取值
+            unittest.mock.patch.object(config, "PARALLEL_BUCKETS", False),
+            unittest.mock.patch.object(config, "BUCKET_LOCK_TIMEOUT_S", 0),
         ]
         for patch in self._patches:
             patch.start()
@@ -170,6 +173,8 @@ class SeedingTests(SessionTestCase):
         text, _ = asyncio.run(driver.send_chat(prompt, seeded_prompt=seeded))
         self.assertEqual(text, "答案")
         self.assertEqual(driver.session_has_history, True)
+        # 新会话 -> 实际发出的是播种版，sent_prompt 必须如实记录（usage 用它估算）
+        self.assertEqual(driver.sent_prompt(), seeded)
 
     def test_existing_session_uses_delta_prompt(self):
         page = FakePage(baseline=["旧"], script=[["新答案"], ["新答案"]])
@@ -185,6 +190,8 @@ class SeedingTests(SessionTestCase):
         driver._send_chat_locked = spy
         asyncio.run(driver.send_chat("DELTA", seeded_prompt="SEEDED"))
         self.assertEqual(seen, ["DELTA"])
+        # 已有历史 -> 实际发出的是增量版
+        self.assertEqual(driver.sent_prompt(), "DELTA")
 
 
 class CapDetectionTests(SessionTestCase):
@@ -393,6 +400,8 @@ class RetryLadderTests(SessionTestCase):
             asyncio.run(driver.send_chat("DELTA", seeded_prompt="SEEDED"))
         # 到顶后不应再恢复同一个会话，直接换新会话 + 播种
         self.assertEqual(prompts, ["DELTA", "SEEDED"])
+        # 中途轮转过 -> sent_prompt 必须是最后一次真正发出的那份（播种版）
+        self.assertEqual(driver.sent_prompt(), "SEEDED")
 
     def test_unrecoverable_run_raises_last_error(self):
         with unittest.mock.patch.object(config, "MAX_UPSTREAM_RETRIES", 2):

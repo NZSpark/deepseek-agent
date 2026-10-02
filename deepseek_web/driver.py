@@ -9,6 +9,7 @@ import json
 import re
 import time
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -26,6 +27,14 @@ class DeepSeekTimeoutError(RuntimeError):
 
 class DeepSeekContextLimitError(RuntimeError):
     """网页会话已达上下文长度上限（网页版会停止响应，必须换新会话）。"""
+
+
+class DeepSeekBusyError(RuntimeError):
+    """某个会话桶正忙（同一会话已有请求在跑且等待超时）。
+
+    与「上游出错」区分开：这是本地的排队保护，客户端稍后重试即可，
+    因此会被映射成 HTTP 503 / SSE ``upstream_busy``，而**不会**触发重试阶梯。
+    """
 
 
 # 未指定任务标识时使用的会话桶（保持与历史行为一致：全局共用一条会话）
@@ -83,6 +92,10 @@ class DeepSeekWebDriver:
         self._page_lock = asyncio.Lock()
         # 浏览器初始化失败时记录原因，让服务仍能启动并对外暴露可读错误
         self.init_error: Optional[str] = None
+        # 每个会话桶最近一次 send_chat **实际**发给网页版的 prompt（增量或播种
+        # 由 driver 内部按会话是否有历史决定）。server / streaming 用它估算 usage，
+        # 避免用调用方“预估”的那份；必须按桶隔离，否则并发时会互相覆盖。
+        self._last_prompts: Dict[str, str] = {}
 
         # ---- 会话状态（按任务分桶，见 config.SESSION_KEY_HEADER）----
         # 每个桶持有：一条独立页面 + 独立会话状态。
@@ -95,6 +108,9 @@ class DeepSeekWebDriver:
         self._page_last_used: Dict[str, float] = {}
         # 按桶并发时的锁（PARALLEL_BUCKETS=true 才启用；默认桶始终用 self.lock）
         self._locks: Dict[str, asyncio.Lock] = {}
+        # 正在处理请求（已拿到锁、正在生成）的会话桶，供 /healthz 观察多 Agent 占用。
+        # 不能用“锁是否被持有”来推断：串行模式下所有桶共用一把锁，会把所有桶都算成忙。
+        self._active_buckets: set = set()
 
     # ---------- 会话桶 ----------
     def _state(self, key: Optional[str] = None) -> SessionState:
@@ -113,6 +129,25 @@ class DeepSeekWebDriver:
             return self.page
         return self._pages.get(bucket)
 
+    def sent_prompt(self, key: Optional[str] = None) -> Optional[str]:
+        """某个会话桶最近一次真正发给网页版的 prompt（可能因轮转由增量改选播种版）。"""
+        return self._last_prompts.get(key or DEFAULT_SESSION_KEY)
+
+    def busy_keys(self) -> List[str]:
+        """当前正在处理请求（已拿到锁、正在生成）的会话桶，供多 Agent 场景观察占用。"""
+        return sorted(self._active_buckets)
+
+    def cluster_stats(self) -> Dict[str, Any]:
+        """多会话 / 多 Agent 运行概况（并发开关、桶上限、占用、已开页面数）。"""
+        return {
+            "parallel": config.PARALLEL_BUCKETS,
+            "max_buckets": config.MAX_SESSION_BUCKETS,
+            "open_pages": len(self._pages),
+            "bucket_lock_timeout_s": config.BUCKET_LOCK_TIMEOUT_S,
+            "busy": self.busy_keys(),
+            "keys": self.session_keys(),
+        }
+
     def _lock_for(self, key: Optional[str] = None) -> asyncio.Lock:
         """取某个会话桶的锁。
 
@@ -127,6 +162,34 @@ class DeepSeekWebDriver:
             lock = asyncio.Lock()
             self._locks[bucket] = lock
         return lock
+
+    @asynccontextmanager
+    async def _session_lock(self, key: Optional[str] = None):
+        """获取某个会话桶的锁；超过 ``BUCKET_LOCK_TIMEOUT_S`` 则抛 ``DeepSeekBusyError``。
+
+        ``BUCKET_LOCK_TIMEOUT_S=0``（默认）表示一直等，保持旧行为；
+        设成正数后，同一会话桶的请求堆叠时会快速失败，而不是排到客户端超时之后。
+        """
+        lock = self._lock_for(key)
+        timeout = config.BUCKET_LOCK_TIMEOUT_S
+        if timeout and timeout > 0:
+            try:
+                await asyncio.wait_for(lock.acquire(), timeout=timeout)
+            except asyncio.TimeoutError:
+                bucket = key or DEFAULT_SESSION_KEY
+                raise DeepSeekBusyError(
+                    f"会话桶 {bucket} 正在处理另一个请求（等待超过 {timeout:g}s）。"
+                    "请稍后重试；若要并发访问，请为每个 Agent 使用不同的会话标识。"
+                ) from None
+        else:
+            await lock.acquire()
+        bucket = key or DEFAULT_SESSION_KEY
+        self._active_buckets.add(bucket)
+        try:
+            yield
+        finally:
+            self._active_buckets.discard(bucket)
+            lock.release()
 
     def _touch_page(self, key: Optional[str] = None) -> None:
         self._page_last_used[key or DEFAULT_SESSION_KEY] = time.monotonic()
@@ -645,6 +708,8 @@ class DeepSeekWebDriver:
 
             # 会话是新开的（或被轮转过）-> 必须播种，否则模型收不到任何上下文
             active_prompt = seeded if not self._state(bucket).has_history else prompt
+            # 记录真正要发出的那份 prompt，供上层估算 usage（按桶隔离，避免并发串台）
+            self._last_prompts[bucket] = active_prompt
 
             await self._remember_session(bucket)
             try:
@@ -780,7 +845,7 @@ class DeepSeekWebDriver:
         page = self._page_for(bucket)
         state = self._state(bucket)
         # 默认所有桶共用 self.lock（串行）；只有 PARALLEL_BUCKETS=true 才按桶各持一把锁
-        async with self._lock_for(bucket):
+        async with self._session_lock(bucket):
             if page is None:
                 raise RuntimeError("浏览器尚未初始化：找不到可用于发送的会话页面。")
             self._touch_page(bucket)  # 正在用的页面不会被空闲回收 / LRU 淘汰

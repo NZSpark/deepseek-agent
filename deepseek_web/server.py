@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from . import config
 from .driver import (
     DEFAULT_SESSION_KEY,
+    DeepSeekBusyError,
     DeepSeekContextLimitError,
     DeepSeekTimeoutError,
     DeepSeekWebDriver,
@@ -95,6 +96,7 @@ async def healthz():
             "session": driver.session_stats(),
             "session_keys": driver.session_keys(),
             "session_scoping": config.SESSION_SCOPING,
+            "cluster": driver.cluster_stats(),
             "init_error": driver.init_error,
         },
     )
@@ -223,7 +225,8 @@ async def chat_completions(
     # 按任务隔离会话：同一 X-DeepSeek-Session 取值的请求共用一条网页会话
     session_key = _session_key(request, x_deepseek_session)
 
-    # 仅用于 usage 估算；真正的选型在 driver.send_chat 内部
+    # 预判：会话没有历史时 driver 会用“播种”prompt。仅用于下面的空输入快速失败；
+    # 真正发出去的那份（以及 usage）以 driver.sent_prompt(session_key) 为准。
     prompt = seeded_prompt if driver.needs_seed(session_key) else delta_prompt
     # 真正要发的那份是空的就直接报错。不能拖到发出去再等：
     # 空输入会让网页版什么都不做，客户端只能等到 180s 超时，很难排查。
@@ -251,6 +254,10 @@ async def chat_completions(
         print("\n[ERR] 网页会话已达上下文长度上限:")
         traceback.print_exc()
         return _error_response(400, str(exc), "context_length_exceeded")
+    except DeepSeekBusyError as exc:
+        # 本地保护：同一会话桶已有请求在跑且等锁超时。稍后重试即可，不是上游故障。
+        print(f"\n[繁忙] {exc}")
+        return _error_response(503, str(exc), "upstream_busy")
     except DeepSeekTimeoutError as exc:
         print("\n[ERR] 等待 DeepSeek 回复超时（已重试）:")
         traceback.print_exc()
@@ -265,6 +272,9 @@ async def chat_completions(
         traceback.print_exc()
         return _error_response(500, str(exc), "server_error")
 
+    # usage 用真正发出去的 prompt 估算（driver 可能选了播种版 / 中途轮转过）。
+    # 按会话桶读取，并发时不会拿到别的 Agent 的 prompt；回退到预判值兼容假 driver。
+    sent_prompt = driver.sent_prompt(session_key) or prompt
     wants_tools = bool(request.tools) and request.tool_choice != "none"
     tool_calls = parse_tool_calls(reply_content, _tool_names(request.tools)) if wants_tools else []
 
@@ -277,9 +287,9 @@ async def chat_completions(
                 finish_reason="tool_calls",
             )],
             usage=Usage(
-                prompt_tokens=estimate_tokens(prompt),
+                prompt_tokens=estimate_tokens(sent_prompt),
                 completion_tokens=estimate_tokens(reply_content),
-                total_tokens=estimate_tokens(prompt) + estimate_tokens(reply_content),
+                total_tokens=estimate_tokens(sent_prompt) + estimate_tokens(reply_content),
             ),
         )
 
@@ -297,9 +307,9 @@ async def chat_completions(
             finish_reason="stop",
         )],
         usage=Usage(
-            prompt_tokens=estimate_tokens(prompt),
+            prompt_tokens=estimate_tokens(sent_prompt),
             completion_tokens=estimate_tokens(reply_content),
-            total_tokens=estimate_tokens(prompt) + estimate_tokens(reply_content),
+            total_tokens=estimate_tokens(sent_prompt) + estimate_tokens(reply_content),
         ),
         saved_files=saved_files,
     )

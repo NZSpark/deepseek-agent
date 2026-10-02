@@ -151,6 +151,16 @@
 ### ⬜ P1-10 剩余　如需更准的 usage
 - 保持“明确标注为估算”的近似公式；若要精确，应接 DeepSeek 自己的分词器（**不是 tiktoken**）。
 
+### ✅ P2-I（本轮新增）　支持多 Agent 并发访问
+- **背景**：分桶只提供上下文隔离，默认所有桶共用 `self.lock`（串行）；多个 Agent 同时访问时会依次排队，排在队尾的请求还可能拖过客户端超时。
+- **已落地**：
+  1. **并发开关**：`.env` 设 `PARALLEL_BUCKETS=true` + `MAX_SESSION_BUCKETS=3`，3 个 Agent 各驱动一条网页会话、真正并行。
+  2. **usage 不再串台**：新增 `driver.sent_prompt(key)`，按会话桶记录“实发 prompt”；`server` / `streaming` 改用它估算 usage。此前的全局单值 `last_prompt` 在并发下会被别的请求覆盖（**写入还在锁外**），已移除。
+  3. **有界排队**：新增 `BUCKET_LOCK_TIMEOUT_S`（默认 0 = 一直等）与 `DeepSeekBusyError`；同一桶等锁超时 → HTTP 503 / SSE `upstream_busy`，不触发重试阶梯。用 `_session_lock()` 上下文管理器实现，确保超时不会泄漏锁。
+  4. **可观测**：`/healthz` 新增 `cluster`（`parallel` / `max_buckets` / `open_pages` / `bucket_lock_timeout_s` / `busy` / `keys`）。
+- **遗留（已知边界）**：同一桶的**并发**仍是固有歧义（同一会话），`BUCKET_LOCK_TIMEOUT_S` 让它有界；本轮只保证**不同桶**之间 usage / 上下文严格隔离。
+- **测试**：`SentPromptIsolationTests` / `BusyLockTests` / `ClusterStatsTests`（含“等锁超时不得泄漏锁”）。
+
 ---
 
 ## 五、落地顺序与状态（本轮）
@@ -164,7 +174,8 @@
 | 5 | **P2-E** 落盘文件名去重 | ✅ |
 | 6 | **P1-C** `_lock_for` + `PARALLEL_BUCKETS` 开关（**默认仍串行**） | ✅ |
 | 7 | **P2-H** 统一就绪等待 + `MAX_SESSION_BUCKETS=0` 语义 | ✅ |
-| 8 | **P2-G** 路由测试升级为真 ASGI（需 httpx；当前环境未安装） | ⬜ 可选 |
+| 8 | **P2-I** 多 Agent 并发：按桶 usage、有界等锁、`/healthz` cluster | ✅ |
+| 9 | **P2-G** 路由测试升级为真 ASGI（需 httpx；当前环境未安装） | ⬜ 可选 |
 
 > 排序理由：先修“会让用户直接撞墙”的和“改动最小”的；P1-C 虽然写在 P1，但**默认不开启就不构成故障**，且开启带风控风险，所以放最后。
 
@@ -212,7 +223,7 @@
 4. **按任务隔离**：`X-DeepSeek-Session`（可用 `SESSION_KEY_HEADER` 改名，`user` 字段兜底）→ 会话桶；每桶独立页面 + 独立状态；`SESSION_SCOPING=false` 关闭分桶。
 5. **手动逃生口**：`POST /session/reset[?session=<key>]`，只改状态（`pending_rotation`）→ 下一轮轮转，**仍会播种**。
 6. **桶页面回收**：`MAX_SESSION_BUCKETS`（默认 8）满时按 **LRU** 关掉最久未用的页面；空闲超过 `BUCKET_IDLE_TTL_S`（默认 900s）的页面也会被关掉。**只关页面、状态保留**，下次重开同一会话并按落点决定是否播种；正在生成回复的桶不会被回收。
-7. **并发**：默认所有桶共用一把锁（**串行**，分桶只隔离上下文）；`PARALLEL_BUCKETS=true` 才按桶各持一把（同时驱动多个网页会话，有风控风险）。
+7. **并发（多 Agent）**：默认所有桶共用一把锁（**串行**，分桶只隔离上下文）；`PARALLEL_BUCKETS=true` 才按桶各持一把（同时驱动多个网页会话，有风控风险）。每个 Agent 一个会话标识即可并行；同一桶再入时受 `BUCKET_LOCK_TIMEOUT_S` 约束（超时返回 503 `upstream_busy`，不触发重试）。
 
 **状态文件格式**（`user_data/.deepseek_session`）：
 
@@ -225,7 +236,7 @@
 }
 ```
 
-旧格式（顶层单会话对象、乃至仅一行 URL 纯文本）仍然可读；默认桶永远在顶层，所以历史行为与旧测试无需改动。**相关配置项速查**：`SESSION_SCOPING` / `SESSION_KEY_HEADER` / `SESSION_KEY_MAX_LEN` / `MAX_SESSION_BUCKETS` / `BUCKET_IDLE_TTL_S` / `PARALLEL_BUCKETS` / `READY_TIMEOUT_MS` / `SESSION_MAX_TURNS` / `SESSION_MAX_TOKENS` / `SEED_MAX_CHARS` / `CAP_CHECK_EVERY` / `CAP_NOTICE_PATTERNS` / `DEEPSEEK_NEW_SESSION` / `DEEPSEEK_TIMEOUT` / `DEEPSEEK_RETRIES`。
+旧格式（顶层单会话对象、乃至仅一行 URL 纯文本）仍然可读；默认桶永远在顶层，所以历史行为与旧测试无需改动。**相关配置项速查**：`SESSION_SCOPING` / `SESSION_KEY_HEADER` / `SESSION_KEY_MAX_LEN` / `MAX_SESSION_BUCKETS` / `BUCKET_IDLE_TTL_S` / `PARALLEL_BUCKETS` / `BUCKET_LOCK_TIMEOUT_S` / `READY_TIMEOUT_MS` / `SESSION_MAX_TURNS` / `SESSION_MAX_TOKENS` / `SEED_MAX_CHARS` / `CAP_CHECK_EVERY` / `CAP_NOTICE_PATTERNS` / `DEEPSEEK_NEW_SESSION` / `DEEPSEEK_TIMEOUT` / `DEEPSEEK_RETRIES`。
 
 ---
 

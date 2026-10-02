@@ -93,6 +93,15 @@ class EndDetectionTestCase(unittest.TestCase):
         self._patch_timeout.start()
         self.addCleanup(self._patch_timeout.stop)
 
+        # 固定并发相关配置，避免依赖开发机上的 .env 取值
+        self._patch_parallel = unittest.mock.patch.object(srv.config, "PARALLEL_BUCKETS", False)
+        self._patch_parallel.start()
+        self.addCleanup(self._patch_parallel.stop)
+
+        self._patch_lock_wait = unittest.mock.patch.object(srv.config, "BUCKET_LOCK_TIMEOUT_S", 0)
+        self._patch_lock_wait.start()
+        self.addCleanup(self._patch_lock_wait.stop)
+
     @staticmethod
     def driver_for(page):
         driver = srv.DeepSeekWebDriver()

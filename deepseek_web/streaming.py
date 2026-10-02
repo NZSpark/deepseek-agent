@@ -8,7 +8,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from . import config
-from .driver import DeepSeekContextLimitError, DeepSeekTimeoutError
+from .driver import DeepSeekBusyError, DeepSeekContextLimitError, DeepSeekTimeoutError
 from .models import ChatCompletionRequest
 from .prompting import estimate_tokens
 from .toolcalls import _tool_names, parse_tool_calls
@@ -72,6 +72,10 @@ async def _stream_chat_completion(
             print("\n[ERR] 网页会话已达上下文长度上限:")
             traceback.print_exc()
             await queue.put(("done", (None, [], str(exc), "context_length_exceeded")))
+        except DeepSeekBusyError as exc:
+            # 本地排队保护：同一会话桶已有请求在跑且等锁超时，对应 HTTP 503 / upstream_busy
+            print(f"\n[繁忙] {exc}")
+            await queue.put(("done", (None, [], str(exc), "upstream_busy")))
         except DeepSeekTimeoutError as exc:
             # 与 server.py 的非流式分支保持一致：超时是 504/timeout，而不是 500
             print("\n[ERR] 等待 DeepSeek 回复超时（已重试）:")
@@ -145,6 +149,9 @@ async def _stream_chat_completion(
         request.stream_options.get("include_usage")
     )
     if include_usage:
+        # usage 用真正发出去的 prompt 估算（driver 可能选了播种版 / 中途轮转过）。
+        # 按会话桶读取，并发时不会拿到别的 Agent 的 prompt；回退到入参 prompt 兼容假 driver。
+        sent_prompt = driver.sent_prompt(session_key) or prompt
         completion_tokens = estimate_tokens(reply_content)
         usage_payload = {
             "id": chat_id,
@@ -153,9 +160,9 @@ async def _stream_chat_completion(
             "model": model,
             "choices": [],
             "usage": {
-                "prompt_tokens": estimate_tokens(prompt),
+                "prompt_tokens": estimate_tokens(sent_prompt),
                 "completion_tokens": completion_tokens,
-                "total_tokens": estimate_tokens(prompt) + completion_tokens,
+                "total_tokens": estimate_tokens(sent_prompt) + completion_tokens,
             },
         }
         yield f"data: {json.dumps(usage_payload, ensure_ascii=False)}\n\n"
