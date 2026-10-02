@@ -26,3 +26,11 @@ HEADLESS=1 python deepseek_api_server.py # 无显示环境（需已登录过）
 ```bash
 python -m unittest discover -s tests -t . -v
 ```
+
+## 自检 / 诊断
+
+```bash
+curl -s localhost:8000/healthz | python -m json.tool          # 就绪状态 + 各会话桶进度
+curl -s localhost:8000/debug/dom | python -m json.tool        # 真实 DOM：回复节点 / 疑似停止按钮
+curl -X POST "localhost:8000/session/reset?session=my-task"   # 重置某个任务的会话（仍会播种历史）
+```

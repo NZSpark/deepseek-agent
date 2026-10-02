@@ -29,6 +29,7 @@ from deepseek_web.config import (  # noqa: F401
     HOST,
     INPUT_SELECTORS,
     LEN_STABLE_POLLS,
+    MAX_SESSION_BUCKETS,
     MAX_UPSTREAM_RETRIES,
     OUTPUT_DIR,
     POLL_INTERVAL_S,
@@ -38,6 +39,9 @@ from deepseek_web.config import (  # noqa: F401
     RESPONSE_TIMEOUT_S,
     RETRY_BACKOFF_S,
     SESSION_FILE,
+    SESSION_KEY_HEADER,
+    SESSION_KEY_MAX_LEN,
+    SESSION_SCOPING,
     SESSION_URL_RE,
     STABLE_POLLS,
     USER_DATA_DIR,
@@ -81,9 +85,16 @@ from deepseek_web.prompting import (  # noqa: F401
 )
 
 # ---- Driver / 流式 / 路由 ----
-from deepseek_web.driver import DeepSeekTimeoutError, DeepSeekWebDriver  # noqa: F401
+from deepseek_web.driver import (  # noqa: F401
+    DEFAULT_SESSION_KEY,
+    DeepSeekContextLimitError,
+    DeepSeekTimeoutError,
+    DeepSeekWebDriver,
+    SessionState,
+)
 from deepseek_web.streaming import _chunk_text, _stream_chat_completion  # noqa: F401
 from deepseek_web.server import (  # noqa: F401
+    _session_key,
     app,
     chat_completions,
     debug_dom,
@@ -91,6 +102,7 @@ from deepseek_web.server import (  # noqa: F401
     healthz,
     lifespan,
     list_models,
+    reset_session,
     root,
 )
 

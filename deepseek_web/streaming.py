@@ -8,6 +8,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from . import config
+from .driver import DeepSeekContextLimitError, DeepSeekTimeoutError
 from .models import ChatCompletionRequest
 from .prompting import estimate_tokens
 from .toolcalls import _tool_names, parse_tool_calls
@@ -17,10 +18,18 @@ def _chunk_text(text: str, size: int = 64) -> List[str]:
     return [text[i:i + size] for i in range(0, len(text), size)] or [""]
 
 
-async def _stream_chat_completion(request: ChatCompletionRequest, prompt: str, driver):
+async def _stream_chat_completion(
+    request: ChatCompletionRequest,
+    prompt: str,
+    driver,
+    seeded_prompt: Optional[str] = None,
+    session_key: Optional[str] = None,
+):
     """以 OpenAI SSE 格式输出 chunk，兼容 Pi 的 openai-completions 流式解析。
 
     ``driver`` 由调用方（server）注入，避免与本模块形成循环依赖。
+    ``seeded_prompt`` 在需要轮转到新会话时使用（重放历史）。
+    ``session_key`` 为按任务隔离会话的桶（None = 默认桶）。
     """
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
@@ -52,18 +61,32 @@ async def _stream_chat_completion(request: ChatCompletionRequest, prompt: str, d
         try:
             # 需要工具时先缓冲（等解析出 tool_calls 再决定输出形态），因此不实时吐字
             reply, blocks = await driver.send_chat(
-                prompt, on_delta=None if wants_tools else on_delta
+                prompt,
+                on_delta=None if wants_tools else on_delta,
+                seeded_prompt=seeded_prompt,
+                key=session_key,
             )
-            await queue.put(("done", (reply, blocks, None)))
+            await queue.put(("done", (reply, blocks, None, None)))
+        except DeepSeekContextLimitError as exc:
+            # 给客户端一个可区分的类型，而不是笼统的 server_error
+            print("\n[ERR] 网页会话已达上下文长度上限:")
+            traceback.print_exc()
+            await queue.put(("done", (None, [], str(exc), "context_length_exceeded")))
+        except DeepSeekTimeoutError as exc:
+            # 与 server.py 的非流式分支保持一致：超时是 504/timeout，而不是 500
+            print("\n[ERR] 等待 DeepSeek 回复超时（已重试）:")
+            traceback.print_exc()
+            await queue.put(("done", (None, [], str(exc), "timeout")))
         except Exception as exc:  # noqa: BLE001
             traceback.print_exc()
-            await queue.put(("done", (None, [], str(exc))))
+            await queue.put(("done", (None, [], str(exc), "server_error")))
 
     task = asyncio.create_task(runner())
 
     streamed = False
     reply_content = ""
     error: Optional[str] = None
+    error_type = "server_error"
     keepalives = 0
 
     while True:
@@ -86,13 +109,13 @@ async def _stream_chat_completion(request: ChatCompletionRequest, prompt: str, d
             streamed = True
             yield encode({"content": payload})
         else:
-            reply_content, _blocks, error = payload
+            reply_content, _blocks, error, error_type = payload
             break
 
     await task
 
     if error:
-        yield f"data: {json.dumps({'error': {'message': error, 'type': 'server_error'}}, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'error': {'message': error, 'type': error_type}}, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
         return
 

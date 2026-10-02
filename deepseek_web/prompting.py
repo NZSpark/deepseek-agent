@@ -69,42 +69,90 @@ def _delta_piece(streamed: str, current: str) -> tuple[Optional[str], str]:
     return piece, streamed[:index] + (piece or "")
 
 
+# 播种时的默认字符预算（server 会传入 config.SEED_MAX_CHARS 覆盖）
+DEFAULT_SEED_MAX_CHARS = 12000
+
+
+def _render_message(message: ChatMessage) -> str:
+    """把单条消息渲染成喂给网页版的一段文本。"""
+    content = _content_to_text(message.content).strip()
+    if message.role == "system":
+        return f"[系统指令]\n{content}"
+    if message.role == "tool":
+        tag = f" {message.tool_call_id}" if message.tool_call_id else ""
+        return f"[工具执行结果{tag}]\n{content}"
+    if message.role == "assistant":
+        return f"[你之前的回复]\n{content}"
+    return content
+
+
+def _last_assistant_index(messages: List[ChatMessage]) -> int:
+    last = -1
+    for index, message in enumerate(messages):
+        if message.role == "assistant":
+            last = index
+    return last
+
+
+def _run_messages(messages: List[ChatMessage]) -> List[ChatMessage]:
+    """取出“最后一条 assistant 之后”的新增消息。"""
+    last_assistant = _last_assistant_index(messages)
+    delta = messages[last_assistant + 1:] if last_assistant >= 0 else messages
+    if not delta:
+        # 兜底：没有新消息时，退回最后一条 user 消息
+        delta = [m for m in messages if m.role == "user"][-1:]
+    return delta
+
+
+def _seed_messages(messages: List[ChatMessage], max_chars: int):
+    """为新会话准备“播种”内容：尽量带上完整上下文，超出预算时保留最近的。
+
+    网页会话一旦轮转（新开会话），后端的上下文就清空了。此时如果还只发增量，
+    模型会收到一条“没有前因”的孤立消息——不报错，但会胡编。
+
+    :return: (system 消息, 保留的其余消息, 是否发生了截断)
+    """
+    systems = [m for m in messages if m.role == "system"]
+    rest = [m for m in messages if m.role != "system"]
+
+    kept: List[ChatMessage] = []
+    used = sum(len(_content_to_text(m.content)) for m in systems)
+    truncated = False
+    for message in reversed(rest):
+        size = len(_content_to_text(message.content))
+        if kept and used + size > max_chars:
+            truncated = True
+            break
+        kept.append(message)
+        used += size
+    kept.reverse()
+    return systems, kept, truncated
+
+
 def build_prompt(
     messages: List[ChatMessage],
     tools: Optional[List[Dict[str, Any]]] = None,
     tool_choice: Optional[Any] = None,
+    seed: bool = False,
+    seed_max_chars: Optional[int] = None,
 ) -> str:
     """把客户端发来的完整 OpenAI 消息数组，转换成要发给网页输入框的文本。
 
-    网页版是一个持续存在的会话，因此无需每轮重发全部历史：
-    只发送“最后一条 assistant 消息之后”的新增消息（新的 user 指令或 tool 结果）。
+    * ``seed=False``（默认）：网页版是一个持续存在的会话，无需每轮重发全部历史，
+      只发送“最后一条 assistant 消息之后”的新增消息（新的 user 指令或 tool 结果）。
+    * ``seed=True``：当前会话是**新开的**，必须把既有上下文一次性播种进去，
+      否则模型会收到一条没有前因的孤立消息。
     """
-    last_assistant = -1
-    for index, message in enumerate(messages):
-        if message.role == "assistant":
-            last_assistant = index
-
-    if last_assistant >= 0:
-        delta = messages[last_assistant + 1:]
+    if seed:
+        systems, kept, truncated = _seed_messages(messages, seed_max_chars or DEFAULT_SEED_MAX_CHARS)
+        parts: List[str] = [
+            "[上下文重建] 这是一个新会话。以下是本次任务此前的对话记录，请据此继续，不要从头重做。"
+        ]
+        if truncated:
+            parts.append("（更早的部分因长度限制已省略，如需可向我确认。）")
+        parts.extend(_render_message(m) for m in systems + kept)
     else:
-        delta = messages
-
-    if not delta:
-        # 兜底：没有新消息时，退回最后一条 user 消息
-        delta = [m for m in messages if m.role == "user"][-1:]
-
-    parts: List[str] = []
-    for message in delta:
-        content = _content_to_text(message.content).strip()
-        if message.role == "system":
-            parts.append(f"[系统指令]\n{content}")
-        elif message.role == "tool":
-            tag = f" {message.tool_call_id}" if message.tool_call_id else ""
-            parts.append(f"[工具执行结果{tag}]\n{content}")
-        elif message.role == "assistant":
-            parts.append(f"[你之前的回复]\n{content}")
-        elif content:
-            parts.append(content)
+        parts = [_render_message(m) for m in _run_messages(messages)]
 
     prompt = "\n\n".join(part for part in parts if part).strip()
 

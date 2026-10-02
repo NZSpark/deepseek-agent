@@ -5,8 +5,10 @@
 """
 
 import asyncio
+import json
 import re
 import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -14,11 +16,56 @@ from playwright.async_api import async_playwright
 
 from . import config, prompting
 from .models import ChatMessage
-from .prompting import _delta_piece
+from .prompting import _delta_piece, estimate_tokens
 
 
 class DeepSeekTimeoutError(RuntimeError):
     """等待网页版回复超时。区别于普通运行时错误，可触发会话恢复。"""
+
+
+class DeepSeekContextLimitError(RuntimeError):
+    """网页会话已达上下文长度上限（网页版会停止响应，必须换新会话）。"""
+
+
+# 未指定任务标识时使用的会话桶（保持与历史行为一致：全局共用一条会话）
+DEFAULT_SESSION_KEY = "default"
+
+
+@dataclass
+class SessionState:
+    """单个会话桶的状态。会话的“是否新开 / 能否复用”都由它决定。"""
+
+    url: Optional[str] = None
+    has_history: bool = False
+    turns: int = 0
+    est_tokens: int = 0
+    cap_hit: bool = False
+    pending_rotation: bool = False
+    last_error: Optional[str] = None
+    updated_at: int = 0
+
+    def to_payload(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_payload(cls, payload: Dict[str, Any]) -> "SessionState":
+        state = cls()
+        if not isinstance(payload, dict):
+            return state
+        url = payload.get("url")
+        if isinstance(url, str):
+            state.url = url
+        for name in ("has_history", "cap_hit", "pending_rotation"):
+            if name in payload:
+                setattr(state, name, bool(payload.get(name)))
+        for name in ("turns", "est_tokens", "updated_at"):
+            try:
+                setattr(state, name, int(payload.get(name) or 0))
+            except (TypeError, ValueError):
+                setattr(state, name, 0)
+        last_error = payload.get("last_error")
+        state.last_error = last_error if isinstance(last_error, str) else None
+        return state
 
 
 class DeepSeekWebDriver:
@@ -29,8 +76,110 @@ class DeepSeekWebDriver:
         self.context = None
         self.page = None
         self.lock = asyncio.Lock()
+        # 仅用于“惰性创建会话桶页面”，避免并发请求为同一 key 重复建页
+        self._page_lock = asyncio.Lock()
         # 浏览器初始化失败时记录原因，让服务仍能启动并对外暴露可读错误
         self.init_error: Optional[str] = None
+
+        # ---- 会话状态（按任务分桶，见 config.SESSION_KEY_HEADER）----
+        # 每个桶持有：一条独立页面 + 独立会话状态。
+        # 「默认桶」继续使用 self.page，因此不涉及分桶的旧调用/测试行为不变。
+        # 会话状态里的 has_history 为 False 时必须“播种”完整上下文，
+        # 否则 build_prompt 只发增量会让模型收到一条没有前因的孤立消息。
+        self._sessions: Dict[str, SessionState] = {}
+        self._pages: Dict[str, Any] = {}
+
+    # ---------- 会话桶 ----------
+    def _state(self, key: Optional[str] = None) -> SessionState:
+        """取出某个会话桶的状态；首次访问时从磁盘恢复。"""
+        bucket = key or DEFAULT_SESSION_KEY
+        state = self._sessions.get(bucket)
+        if state is None:
+            state = SessionState.from_payload(self._load_session_state(bucket))
+            self._sessions[bucket] = state
+        return state
+
+    def _page_for(self, key: Optional[str] = None):
+        """取出某个会话桶的页面；默认桶就是 ``self.page``。"""
+        bucket = key or DEFAULT_SESSION_KEY
+        if bucket == DEFAULT_SESSION_KEY:
+            return self.page
+        return self._pages.get(bucket)
+
+    async def _ensure_page(self, key: Optional[str]) -> None:
+        """为额外会话桶惰性创建页面并回到它上次的会话（如存在）。"""
+        bucket = key or DEFAULT_SESSION_KEY
+        if bucket == DEFAULT_SESSION_KEY or bucket in self._pages:
+            return
+        async with self._page_lock:
+            if bucket in self._pages:  # 并发请求可能已经建好了
+                return
+            if self.context is None:
+                raise RuntimeError("浏览器尚未初始化，无法创建新的会话页面。")
+            if len(self._pages) >= max(1, config.MAX_SESSION_BUCKETS):
+                raise RuntimeError(
+                    f"会话桶数量已达上限（{config.MAX_SESSION_BUCKETS}），"
+                    "请用 POST /session/reset 回收不再使用的会话。"
+                )
+            page = await self.context.new_page()
+            self._pages[bucket] = page
+            state = self._state(bucket)
+            # 回到该桶上次的会话；若上次已到顶则开新会话（首轮会播种）
+            target = "https://chat.deepseek.com/" if state.cap_hit else (
+                state.url or "https://chat.deepseek.com/"
+            )
+            await page.goto(target, wait_until="domcontentloaded")
+            state.has_history = bool(state.url) and not state.cap_hit
+        print(f"[会话] 已为 key={bucket} 创建独立会话页面（{target}）")
+
+    # ---- 默认桶的状态：保留为属性，兼容既有调用与测试 ----
+    @property
+    def session_has_history(self) -> bool:
+        return self._state().has_history
+
+    @session_has_history.setter
+    def session_has_history(self, value: bool) -> None:
+        self._state().has_history = bool(value)
+
+    @property
+    def session_turns(self) -> int:
+        return self._state().turns
+
+    @session_turns.setter
+    def session_turns(self, value: int) -> None:
+        self._state().turns = int(value)
+
+    @property
+    def session_est_tokens(self) -> int:
+        return self._state().est_tokens
+
+    @session_est_tokens.setter
+    def session_est_tokens(self, value: int) -> None:
+        self._state().est_tokens = int(value)
+
+    @property
+    def session_cap_hit(self) -> bool:
+        return self._state().cap_hit
+
+    @session_cap_hit.setter
+    def session_cap_hit(self, value: bool) -> None:
+        self._state().cap_hit = bool(value)
+
+    @property
+    def last_error(self) -> Optional[str]:
+        return self._state().last_error
+
+    @last_error.setter
+    def last_error(self, value: Optional[str]) -> None:
+        self._state().last_error = value
+
+    @property
+    def _pending_rotation(self) -> bool:
+        return self._state().pending_rotation
+
+    @_pending_rotation.setter
+    def _pending_rotation(self, value: bool) -> None:
+        self._state().pending_rotation = bool(value)
 
     async def init(self):
         """初始化浏览器实例"""
@@ -61,11 +210,46 @@ class DeepSeekWebDriver:
                 ) from exc
             raise
         self.page = await self.context.new_page()
+        await self._restore_session_on_startup()
+
+    async def _restore_session_on_startup(self) -> None:
+        """启动时的会话决策（单独成方法，便于不启动真浏览器就能测）。
+
+        默认复用上次会话（保住跨重启的上下文）；只有在“上次已到顶”或显式设置
+        ``DEEPSEEK_NEW_SESSION`` 时才开新会话。
+        """
+        state = self._load_session_state()
+        self.session_turns = int(state.get("turns") or 0)
+        self.session_est_tokens = int(state.get("est_tokens") or 0)
+        self.session_cap_hit = bool(state.get("cap_hit"))
+        self.last_error = state.get("last_error") or None
         saved_session = self._saved_session_url()
-        target = saved_session or "https://chat.deepseek.com/"
+
+        # 默认复用上次会话（保住跨重启的上下文）；只有在“上次已到顶”或显式要求时才新开
+        start_fresh = config.NEW_SESSION_ON_START
+        if start_fresh:
+            print("[会话] DEEPSEEK_NEW_SESSION 已开启：忽略已保存的会话，直接开新会话。")
+        elif self.session_cap_hit:
+            print("[会话] 上次会话已达上下文长度上限，启动时改为开新会话（首轮会播种历史）。")
+            start_fresh = True
+
+        if start_fresh:
+            target = "https://chat.deepseek.com/"
+        else:
+            target = saved_session or "https://chat.deepseek.com/"
+
         await self.page.goto(target, wait_until="domcontentloaded")
-        if saved_session:
-            print(f"\n[系统提示] 已恢复到上次的会话: {saved_session}")
+
+        if start_fresh:
+            self.session_has_history = False
+            self.session_turns = 0
+            self.session_est_tokens = 0
+            self.session_cap_hit = False
+            self._save_session_state(clear_url=True)
+        else:
+            self.session_has_history = bool(saved_session)
+            if saved_session:
+                print(f"\n[系统提示] 已恢复到上次的会话: {saved_session}")
         print("[系统提示] 服务启动成功！请确保 DeepSeek 页面保持登录状态。\n")
 
     # ---------- 会话上下文 -> 单条 prompt ----------
@@ -83,52 +267,218 @@ class DeepSeekWebDriver:
         return prompting.build_prompt(messages, tools, tool_choice)
 
     # ---------- 会话持久化与恢复 ----------
-    def _current_session_url(self) -> Optional[str]:
-        """当前页面若处于某个会话中，返回其规范化会话地址。"""
+    def _current_session_url(self, key: Optional[str] = None) -> Optional[str]:
+        """某个会话桶的页面若处于会话中，返回其规范化会话地址。"""
+        page = self._page_for(key)
         try:
-            url = self.page.url if self.page else ""
+            url = page.url if page else ""
         except Exception:
             url = ""
         match = config.SESSION_URL_RE.search(url or "")
         return match.group(0) if match else None
 
-    def _saved_session_url(self) -> Optional[str]:
-        """读取已保存的会话地址（若存在且合法）。"""
+    # ---------- 会话状态（url + 轮数 / 体积 / 是否到顶）----------
+    def _read_state_file(self) -> Dict[str, Any]:
+        """读取原始状态文件（解析失败或非 JSON 时返回空字典）。"""
+        try:
+            if not config.SESSION_FILE.exists():
+                return {}
+            raw = config.SESSION_FILE.read_text(encoding="utf-8").strip()
+        except Exception:
+            return {}
+        if not raw.startswith("{"):
+            return {}
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _load_session_state(self, key: Optional[str] = None) -> Dict[str, Any]:
+        """读取某个会话桶的状态。
+
+        兼容两种旧格式：文件内容是单独的会话 URL 纯文本、或顶层直接放单会话对象。
+        """
+        bucket = key or DEFAULT_SESSION_KEY
+        raw = ""
         try:
             if config.SESSION_FILE.exists():
-                url = config.SESSION_FILE.read_text(encoding="utf-8").strip()
-                if config.SESSION_URL_RE.fullmatch(url):
-                    return url
+                raw = config.SESSION_FILE.read_text(encoding="utf-8").strip()
         except Exception:
-            pass
-        return None
+            return {}
+        if not raw:
+            return {}
+        if not raw.startswith("{"):
+            # 旧格式：单独的会话 URL（只可能对应默认桶）
+            if bucket == DEFAULT_SESSION_KEY and config.SESSION_URL_RE.fullmatch(raw):
+                return {"url": raw}
+            return {}
+        data = self._read_state_file()
+        if bucket == DEFAULT_SESSION_KEY:
+            # 历史格式：默认桶的状态字段直接放在文件顶层
+            return {k: v for k, v in data.items() if k not in ("sessions", "version")}
+        extra = data.get("sessions")
+        own = extra.get(bucket) if isinstance(extra, dict) else None
+        return own if isinstance(own, dict) else {}
 
-    async def _remember_session(self) -> None:
-        """把当前会话地址写入磁盘，供后续恢复使用。"""
-        url = self._current_session_url()
-        if not url:
-            return
+    def _save_session_state(self, clear_url: bool = False, key: Optional[str] = None) -> None:
+        """落盘某个会话桶的状态，供后续恢复 / 轮转决策使用。
+
+        文件格式（同时兼容历史格式）：
+
+        * **默认桶**的状态字段直接放在顶层（与历史文件完全一致）；
+        * 其余桶放在 ``sessions`` 下，各任务互不影响。
+        """
+        bucket = key or DEFAULT_SESSION_KEY
+        state = self._state(bucket)
+        # 优先取页面当前地址；页面不存在或停在首页时，保留状态里已知的 url，不覆盖
+        url = None if clear_url else (self._current_session_url(bucket) or state.url)
+        state.url = url
+        state.updated_at = int(time.time())
+        payload = state.to_payload()
+
+        data = self._read_state_file()
+        extra = data.get("sessions")
+        extra = dict(extra) if isinstance(extra, dict) else {}
+        if bucket == DEFAULT_SESSION_KEY:
+            payload["sessions"] = extra
+        else:
+            extra[bucket] = payload
+            # 顶层的默认桶状态原样保留（缺 url 时补 null，便于直接查看默认桶）
+            data = {k: v for k, v in data.items() if k != "sessions"}
+            data.setdefault("url", None)
+            data["sessions"] = extra
+            payload = data
         try:
             config.SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
-            config.SESSION_FILE.write_text(url, encoding="utf-8")
+            config.SESSION_FILE.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
         except Exception:
             pass
 
-    async def _recover_session(self) -> bool:
+    def _saved_session_url(self, key: Optional[str] = None) -> Optional[str]:
+        """读取已保存的会话地址（若存在且合法）。"""
+        url = self._load_session_state(key).get("url")
+        if isinstance(url, str) and config.SESSION_URL_RE.fullmatch(url):
+            return url
+        return None
+
+    async def _remember_session(self, key: Optional[str] = None) -> None:
+        """刷新落盘的会话状态（保留此名字，兼容既有调用）。"""
+        self._save_session_state(key=key)
+
+    def session_keys(self) -> List[str]:
+        """当前在用的会话桶（至少包含默认桶）。"""
+        return sorted({DEFAULT_SESSION_KEY, *self._sessions})
+
+    def needs_seed(self, key: Optional[str] = None) -> bool:
+        """某个会话桶的网页会话里没有可用上下文时，需要把完整历史播种进去。"""
+        return not self._state(key).has_history
+
+    def session_stats(self, key: Optional[str] = None) -> Dict[str, Any]:
+        """供 /healthz 观察会话增长情况。"""
+        state = self._state(key)
+        return {
+            "url": self._current_session_url(key),
+            "has_history": state.has_history,
+            "needs_seed": self.needs_seed(key),
+            "turns": state.turns,
+            "est_tokens": state.est_tokens,
+            "cap_hit": state.cap_hit,
+            "pending_rotation": state.pending_rotation,
+            "last_error": state.last_error,
+            "buckets": self.session_keys(),
+        }
+
+    def _session_over_budget(self, key: Optional[str] = None) -> bool:
+        """会话体积是否已达到轮转阈值（0 表示禁用该维度）。"""
+        state = self._state(key)
+        if config.SESSION_MAX_TURNS and state.turns >= config.SESSION_MAX_TURNS:
+            return True
+        if config.SESSION_MAX_TOKENS and state.est_tokens >= config.SESSION_MAX_TOKENS:
+            return True
+        return False
+
+    async def _start_new_session(self, key: Optional[str] = None) -> None:
+        """轮转到新会话，并重置会话状态（调用方必须使用“播种”prompt）。"""
+        page = self._page_for(key)
+        if page is None:
+            return
+        await page.goto("https://chat.deepseek.com/", wait_until="domcontentloaded")
+        try:
+            await page.wait_for_selector(
+                config.READY_SELECTOR, timeout=15000, state="visible"
+            )
+        except Exception:
+            print("[轮转] 新会话页面已打开，但未检测到输入框，请检查登录状态。")
+        state = self._state(key)
+        state.has_history = False
+        state.turns = 0
+        state.est_tokens = 0
+        state.cap_hit = False
+        state.pending_rotation = False
+        state.last_error = None
+        self._save_session_state(clear_url=True, key=key)
+        print("[轮转] 已开启新的网页会话（本轮会用完整历史播种上下文）。")
+
+    _CAP_CHECK_JS_TEMPLATE = (
+        "() => { let text = document.body ? (document.body.innerText || '') : '';"
+        " for (const node of document.querySelectorAll(%s)) {"
+        " const t = node.innerText || ''; if (t) text = text.replace(t, ' '); }"
+        " return text; }"
+    )
+
+    async def _page_shows_context_limit(self, key: Optional[str] = None) -> bool:
+        """页面是否出现“对话长度上限”类提示。
+
+        先把模型回复节点的文本从整页文本里剔除，避免把回复正文里提到
+        “长度上限”误判成网页版的提示。
+        """
+        page = self._page_for(key)
+        if page is None:
+            return False
+        js = self._CAP_CHECK_JS_TEMPLATE % json.dumps(config.RESPONSE_SELECTORS)
+        try:
+            page_text = await page.evaluate(js)
+        except Exception:
+            return False
+        for pattern in config.CAP_NOTICE_PATTERNS:
+            try:
+                if re.search(pattern, page_text or "", re.IGNORECASE):
+                    return True
+            except re.error:
+                continue
+        return False
+
+    def _mark_context_limit(self, key: Optional[str] = None) -> None:
+        state = self._state(key)
+        state.cap_hit = True
+        state.last_error = "context_length_exceeded"
+        self._save_session_state(key=key)
+
+    def _context_limit_error(self) -> "DeepSeekContextLimitError":
+        return DeepSeekContextLimitError(
+            "DeepSeek 网页会话已达上下文长度上限（网页版会停止响应）。"
+            "本服务会自动轮转到新会话并播种历史；若仍失败，请检查登录状态。"
+        )
+
+    async def _recover_session(self, key: Optional[str] = None) -> bool:
         """超时后根据保存的会话地址重新进入会话，成功返回 True。"""
-        saved = self._saved_session_url()
-        if not saved:
+        page = self._page_for(key)
+        saved = self._saved_session_url(key)
+        if page is None or not saved:
             print("[恢复] 未找到已保存的会话链接，无法恢复。")
             return False
         try:
-            current = self._current_session_url()
+            current = self._current_session_url(key)
             print(f"[恢复] 正在根据保存的会话链接重新进入会话: {saved}")
             if current == saved:
-                await self.page.reload(wait_until="domcontentloaded")
+                await page.reload(wait_until="domcontentloaded")
             else:
-                await self.page.goto(saved, wait_until="domcontentloaded")
+                await page.goto(saved, wait_until="domcontentloaded")
             try:
-                await self.page.wait_for_selector(
+                await page.wait_for_selector(
                     config.READY_SELECTOR, timeout=15000, state="visible"
                 )
             except Exception:
@@ -140,32 +490,72 @@ class DeepSeekWebDriver:
             print(f"[恢复] 重新进入会话失败: {exc}")
             return False
 
-    async def send_chat(self, prompt: str, on_delta=None) -> tuple[str, List[dict]]:
+    async def send_chat(
+        self,
+        prompt: str,
+        on_delta=None,
+        seeded_prompt: Optional[str] = None,
+        key: Optional[str] = None,
+    ) -> tuple[str, List[dict]]:
         """发送单条消息并获取响应。
 
-        正常路径委托给 ``_send_chat_locked``；一旦等待回复超时
-        （此时说明页面上完全没有产生新回复，消息很可能根本没发出去），
-        则根据保存的会话链接重新进入会话并重试。
-        如果超时前已经读到实质回复，``_send_chat_locked`` 会直接返回内容，
-        不再触发重发，避免网页多出一轮、与状态错位。
+        :param prompt: 增量 prompt（网页会话已有上下文时使用）
+        :param seeded_prompt: 带完整历史的“播种”prompt（需要新开会话时使用，
+                              未提供则退回 ``prompt``）
+        :param key: 会话桶标识（按任务隔离会话）。不同 key 各自持有一条独立
+                    的网页会话与页面，互不污染上下文；None 表示默认桶。
+
+        **重试阶梯**（避免在同一个已失效的会话上反复超时）：
+
+        1. 首级：直接用现有会话（若已达体积预算或上次到顶，先轮转到新会话）；
+        2. 中间级：按保存的会话链接恢复**同一个**会话（只重开页面）；
+        3. 最高一级：**换新会话 + 用播种 prompt 重放历史**。
+
+        为什么把“换新会话”当作最后手段，而不是一直恢复同一个会话：
+        页面完全没有新回复（超时）最常见的原因就是会话已到顶 / 已失效，
+        重复打开同一个会话注定再次超时。而换新会话只有在有“播种”能力时才安全。
         """
-        last_error: Optional[DeepSeekTimeoutError] = None
-        for attempt in range(1, config.MAX_UPSTREAM_RETRIES + 1):
-            await self._remember_session()
-            try:
-                return await self._send_chat_locked(prompt, on_delta)
-            except DeepSeekTimeoutError as exc:
-                # 只有「超时」才可重试；找不到输入框、profile 被占用等属于不可重试
-                last_error = exc
-                if attempt >= config.MAX_UPSTREAM_RETRIES:
-                    break
-                print(
-                    f"[恢复] 等待回复超时（第 {attempt}/{config.MAX_UPSTREAM_RETRIES} 次），"
-                    "尝试根据保存的会话链接恢复会话后重试……"
-                )
-                if not await self._recover_session():
+        bucket = key or DEFAULT_SESSION_KEY
+        seeded = seeded_prompt or prompt
+        max_attempts = max(1, config.MAX_UPSTREAM_RETRIES)
+        last_error: Optional[RuntimeError] = None
+
+        # 额外的会话桶需要自己的页面（默认桶就是 self.page，不涉及创建）
+        await self._ensure_page(bucket)
+
+        for attempt in range(1, max_attempts + 1):
+            state = self._state(bucket)
+            if state.pending_rotation:
+                # 体积超预算或上次检测到“到顶”：先轮转，再播种
+                await self._start_new_session(bucket)
+            elif attempt == 1:
+                pass
+            elif attempt < max_attempts:
+                print(f"[恢复] 第 {attempt}/{max_attempts} 次重试：恢复同一个会话……")
+                if not await self._recover_session(bucket):
                     break
                 await asyncio.sleep(config.RETRY_BACKOFF_S * attempt)
+            else:
+                print("[恢复] 恢复同一会话无效，改为开启新会话并重放历史……")
+                await self._start_new_session(bucket)
+
+            # 会话是新开的（或被轮转过）-> 必须播种，否则模型收不到任何上下文
+            active_prompt = seeded if not self._state(bucket).has_history else prompt
+
+            await self._remember_session(bucket)
+            try:
+                return await self._send_chat_locked(active_prompt, on_delta, key=bucket)
+            except DeepSeekContextLimitError as exc:
+                # 到顶了：下次不要再恢复同一个会话，直接轮转
+                last_error = exc
+                self._state(bucket).pending_rotation = True
+                print(f"[恢复] 第 {attempt}/{max_attempts} 次失败：会话已达上下文上限。")
+            except DeepSeekTimeoutError as exc:
+                # 只有「超时 / 到顶」才可重试；找不到输入框、profile 被占用等不可重试
+                last_error = exc
+                self._state(bucket).last_error = str(exc)
+                print(f"[恢复] 第 {attempt}/{max_attempts} 次失败：等待回复超时。")
+
         if last_error is not None:
             raise last_error
         raise RuntimeError("上游请求未能发送")
@@ -196,14 +586,17 @@ class DeepSeekWebDriver:
     }
     """
 
-    async def _page_is_generating(self) -> Optional[bool]:
+    async def _page_is_generating(self, key: Optional[str] = None) -> Optional[bool]:
         """检测页面是否仍在生成回复。
 
         True=生成中；False=页面上找不到「停止生成」控件；None=检测失败/无法判断。
         注意：只有在观测到过 True 之后，False 才可信，调用方需自行记录。
         """
+        page = self._page_for(key)
+        if page is None:
+            return None
         try:
-            return bool(await self.page.evaluate(self._GENERATING_JS))
+            return bool(await page.evaluate(self._GENERATING_JS))
         except Exception:
             return None
 
@@ -238,10 +631,13 @@ class DeepSeekWebDriver:
     }
     """
 
-    async def debug_stop_candidates(self) -> List[dict]:
+    async def debug_stop_candidates(self, key: Optional[str] = None) -> List[dict]:
         """诊断用：列出页面上所有「可能表示生成中」的控件及其位置。"""
+        page = self._page_for(key)
+        if page is None:
+            return []
         try:
-            return await self.page.evaluate(self._STOP_CANDIDATES_JS)
+            return await page.evaluate(self._STOP_CANDIDATES_JS)
         except Exception as exc:  # noqa: BLE001
             return [{"error": str(exc)}]
 
@@ -269,17 +665,24 @@ class DeepSeekWebDriver:
             extracted.append({"lang": lang, "code": clean_code})
         return extracted
 
-    async def _send_chat_locked(self, prompt: str, on_delta=None) -> tuple[str, List[dict]]:
+    async def _send_chat_locked(self, prompt: str, on_delta=None,
+                                key: Optional[str] = None) -> tuple[str, List[dict]]:
         """发送单条消息并获取响应及提取的代码块。
 
         :param on_delta: 可选异步回调，生成过程中实时吐出增量文本（用于 SSE 流式）。
+        :param key: 会话桶标识（决定使用哪一条页面）。
         """
+        bucket = key or DEFAULT_SESSION_KEY
+        page = self._page_for(bucket)
+        state = self._state(bucket)
         async with self.lock:
+            if page is None:
+                raise RuntimeError("浏览器尚未初始化：找不到可用于发送的会话页面。")
             # 1. 定位并填入输入框
             chat_input = None
             for selector in config.INPUT_SELECTORS:
                 try:
-                    chat_input = await self.page.wait_for_selector(selector, timeout=3000)
+                    chat_input = await page.wait_for_selector(selector, timeout=3000)
                     if chat_input:
                         break
                 except Exception:
@@ -295,14 +698,14 @@ class DeepSeekWebDriver:
             # 那样会导致永远读不到本轮回复直接等到超时。
             before_text = ""
             try:
-                before_nodes = await self.page.query_selector_all(config.RESPONSE_SELECTORS)
+                before_nodes = await page.query_selector_all(config.RESPONSE_SELECTORS)
                 if before_nodes:
                     before_text = (await before_nodes[-1].inner_text()).strip()
             except Exception:
                 before_text = ""
 
             await chat_input.fill(prompt)
-            await self.page.keyboard.press("Enter")
+            await page.keyboard.press("Enter")
 
             # 2. 轮询等待回复完成
             await asyncio.sleep(config.POLL_INTERVAL_S)
@@ -316,9 +719,11 @@ class DeepSeekWebDriver:
             poll = 0
             deadline = asyncio.get_event_loop().time() + config.RESPONSE_TIMEOUT_S
 
+            cap_check_every = max(1, config.CAP_CHECK_EVERY)
+
             while True:
                 poll += 1
-                responses = await self.page.query_selector_all(config.RESPONSE_SELECTORS)
+                responses = await page.query_selector_all(config.RESPONSE_SELECTORS)
                 current_text = ""
                 generating = None
                 if responses:
@@ -328,10 +733,20 @@ class DeepSeekWebDriver:
 
                 # 1. 本轮回复是否已经出现：只要最后一条回复的内容与发送前不同即可。
                 #    （不看节点数量：长会话下新回复会原地替换旧节点，数量不增长）
-                if normalized and normalized != before_text:
+                reply_seen = bool(normalized) and normalized != before_text
+
+                # 1.1 还没有新回复时，周期性检查是否“会话到顶”。
+                #     到顶与“真的卡住”在外表上完全一样（页面不再产生新回复），
+                #     不主动看提示语就只能等到超时，而那时已经分不清原因了。
+                if not reply_seen and poll % cap_check_every == 0:
+                    if await self._page_shows_context_limit(bucket):
+                        self._mark_context_limit(bucket)
+                        raise self._context_limit_error()
+
+                if reply_seen:
                     # 2.1 主判定：页面「生成中」状态。一旦观测到过「停止生成」
                     #     控件、又发现它消失，就说明生成真正结束，可立即收尾
-                    generating = await self._page_is_generating()
+                    generating = await self._page_is_generating(bucket)
                     if generating:
                         saw_generating = True
                     elif generating is False and saw_generating:
@@ -380,10 +795,14 @@ class DeepSeekWebDriver:
                 # 总超时判定：若这期间其实已经读到实质回复，就直接返回已产生的内容，
                 # 绝不再把同一句 prompt 重发一遍（避免网页多出一轮、与客户端状态错位）
                 if asyncio.get_event_loop().time() > deadline:
-                    await self._remember_session()
+                    await self._remember_session(bucket)
                     if last_text:
                         print("[超时] 已读取到回复内容，直接返回，不重发。")
                         break
+                    # 超时前最后确认一次是否“到顶”，否则错误信息会误导排查方向
+                    if await self._page_shows_context_limit(bucket):
+                        self._mark_context_limit(bucket)
+                        raise self._context_limit_error()
                     raise DeepSeekTimeoutError(
                         f"等待 DeepSeek 响应超时（{int(config.RESPONSE_TIMEOUT_S)}s）。"
                     )
@@ -393,8 +812,21 @@ class DeepSeekWebDriver:
             # 3. 从最新回复节点中提取代码块
             extracted_blocks = await self._extract_code_blocks(latest_node)
 
-            # 成功产生回复后，刷新保存的会话地址（可能刚创建了新会话）
-            await self._remember_session()
+            # 4. 更新会话状态：已建立历史，并累计体积；超预算则下一轮轮转
+            state.has_history = True
+            state.turns += 1
+            state.est_tokens += estimate_tokens(prompt) + estimate_tokens(last_text)
+            state.last_error = None
+            if self._session_over_budget(bucket):
+                state.pending_rotation = True
+                print(
+                    f"[轮转] 会话已达预算（轮数={state.turns}，"
+                    f"估算 token={state.est_tokens}），"
+                    "下一轮将开启新会话并播种上下文。"
+                )
+
+            # 成功产生回复后，刷新保存的会话状态（可能刚创建了新会话）
+            await self._remember_session(bucket)
             return last_text, extracted_blocks
 
     @staticmethod
@@ -431,6 +863,20 @@ class DeepSeekWebDriver:
             saved.append(str(filepath))
 
         return saved
+
+    def reset_session(self, key: Optional[str] = None) -> None:
+        """把某个会话桶标记为“下一轮开新会话”（手动逃生口）。
+
+        只改状态、不碰页面：下一轮的 ``send_chat`` 会先轮转，并用“播种”
+        prompt 重放历史，所以不会丢上下文。
+        """
+        bucket = key or DEFAULT_SESSION_KEY
+        state = self._state(bucket)
+        state.pending_rotation = True
+        state.cap_hit = False
+        state.has_history = False
+        self._save_session_state(clear_url=True, key=bucket)
+        print(f"[会话] 已请求重置 key={bucket} 的会话，下一轮将开启新会话并播种上下文。")
 
     async def close(self):
         if self.context:

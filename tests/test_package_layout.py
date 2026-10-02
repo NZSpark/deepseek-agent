@@ -40,6 +40,23 @@ class EntryPointCompatTests(unittest.TestCase):
         missing = [name for name in self.HISTORICAL_NAMES if not hasattr(entry, name)]
         self.assertEqual(missing, [])
 
+    # 会话分桶与手动重置引入的新公开名字
+    NEW_NAMES = [
+        "DEFAULT_SESSION_KEY",
+        "SessionState",
+        "DeepSeekContextLimitError",
+        "reset_session",
+        "_session_key",
+        "SESSION_KEY_HEADER",
+        "SESSION_SCOPING",
+        "SESSION_KEY_MAX_LEN",
+        "MAX_SESSION_BUCKETS",
+    ]
+
+    def test_new_names_are_reexported(self):
+        missing = [name for name in self.NEW_NAMES if not hasattr(entry, name)]
+        self.assertEqual(missing, [])
+
     def test_config_module_is_reachable_from_entry(self):
         # tests patch 的是 entry.config.*，必须是同一个模块对象
         self.assertIs(entry.config, config)
@@ -73,7 +90,13 @@ class ConfigTests(unittest.TestCase):
 class AppTests(unittest.TestCase):
     def test_routes_exist(self):
         paths = {r.path for r in entry.app.routes if hasattr(r, "path")}
-        for expected in ("/v1/models", "/v1/chat/completions", "/healthz", "/debug/dom"):
+        for expected in (
+            "/v1/models",
+            "/v1/chat/completions",
+            "/healthz",
+            "/debug/dom",
+            "/session/reset",
+        ):
             self.assertIn(expected, paths)
 
     def test_streaming_generator_accepts_injected_driver(self):
@@ -83,7 +106,25 @@ class AppTests(unittest.TestCase):
         from deepseek_web.streaming import _stream_chat_completion
 
         params = list(inspect.signature(_stream_chat_completion).parameters)
-        self.assertEqual(params, ["request", "prompt", "driver"])
+        self.assertEqual(
+            params, ["request", "prompt", "driver", "seeded_prompt", "session_key"]
+        )
+
+    def test_env_example_documents_every_config_key(self):
+        """新增配置项时必须同步写进 .env.example（config 是唯一真源）。"""
+        import re
+
+        config_src = Path(config.__file__).read_text(encoding="utf-8")
+        used = set(re.findall(r'env_(?:str|int|float|bool)\(\s*"([A-Z_]+)"', config_src))
+        example = Path(__file__).resolve().parent.parent / ".env.example"
+        declared = set(re.findall(r"^([A-Z_]+)=", example.read_text(encoding="utf-8"), re.M))
+        self.assertEqual(sorted(used - declared), [], ".env.example 缺少这些配置项")
+
+    def test_cap_notice_patterns_are_valid_regex(self):
+        import re
+
+        for pattern in config.CAP_NOTICE_PATTERNS:
+            re.compile(pattern)  # 不合法会直接抛错
 
 
 if __name__ == "__main__":

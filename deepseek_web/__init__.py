@@ -13,7 +13,13 @@
 """
 
 from . import config
-from .driver import DeepSeekTimeoutError, DeepSeekWebDriver
+from .driver import (
+    DEFAULT_SESSION_KEY,
+    DeepSeekContextLimitError,
+    DeepSeekTimeoutError,
+    DeepSeekWebDriver,
+    SessionState,
+)
 from .models import ChatCompletionRequest, ChatCompletionResponse, ChatMessage
 from .prompting import build_prompt, estimate_tokens
 from .toolcalls import parse_tool_calls, to_tool_call_models
@@ -23,8 +29,11 @@ __all__ = [
     "ChatCompletionRequest",
     "ChatCompletionResponse",
     "ChatMessage",
+    "DEFAULT_SESSION_KEY",
+    "DeepSeekContextLimitError",
     "DeepSeekTimeoutError",
     "DeepSeekWebDriver",
+    "SessionState",
     "build_prompt",
     "estimate_tokens",
     "parse_tool_calls",

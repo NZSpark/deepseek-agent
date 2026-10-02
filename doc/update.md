@@ -1,6 +1,7 @@
 # 项目改进建议 (doc/update.md)
 
-> 基于对当前代码库的审查（`deepseek_api_server.py` / `deepseek_agent.py` / `client_test.py` / README / 配置）。
+> 基于对当前代码库的审查（`deepseek_api_server.py` / `deepseek_web/` / `client_test.py` / README / 配置）。
+> （初版审查时的 `deepseek_agent.py` 已在后续修订中删除，见 P2-13。）
 > 按优先级分层，P0 为正确性/可用性阻塞项，P1 为健壮性，P2 为工程质量。
 
 ## 修订记录
@@ -11,7 +12,10 @@
 | 对齐当前代码 | 标注已完成项；修正两条不准确的建议（`tiktoken`、`baseline_count`）；补上调试工具与新增能力；更新行数等数字 |
 | 新增 P0-0 | **会话无上限增长**（长期复用同一会话的后果与方案）；补 `.env` 配置中心；更新行数 |
 | P0-0 补充设计原则 | 补充**设计原则与备选方案评估**（否决“每次启动新开会话”与“超时后复用旧会话”两种直觉方案）；重排实现顺序（**播种优先**） |
-| 本次 | 完成 **P2-11 模块拆分**：单文件 → `deepseek_web` 包 + 薄入口；补模块结构回归测试；测试增至 54 例 |
+| 完成 P2-11 | 完成 **模块拆分**：单文件 → `deepseek_web` 包 + 薄入口；补模块结构回归测试；测试增至 54 例 |
+| 完成 P0-0 第 1–4 步 | 完成 **会话播种 / 到顶检测 / 重试阶梯 / 会话状态与自动轮转**；修正本文件里的过时路径与用例数；测试增至 88 例 |
+| 完成 P0-0 剩余项 | 完成 **按任务隔离会话**（`X-DeepSeek-Session` 分桶，每桶独立页面与会话状态）、**`POST /session/reset` 手动逃生口**、**路由层测试**（不依赖 httpx）；测试增至 129 例 |
+| 删除 `deepseek_agent.py` | 落实 P2-13 的另一种处置：该文件与 `deepseek_web` 功能重叠且无测试覆盖，直接删除（原文已归档在 git 历史中）|
 
 > 状态标记：✅ 已完成　🔶 部分完成　⬜ 未完成
 >
@@ -24,23 +28,24 @@
 | 项 | 状态 |
 | --- | --- |
 | 入口 `deepseek_api_server.py` | **101 行薄封装**：重新导出历史公开名字 + 启动 uvicorn |
-| 实现 `deepseek_web/` | 拆为 8 个模块（共约 1369 行）：`config` / `models` / `toolcalls` / `prompting` / `driver` / `streaming` / `server` / `__init__` |
+| 实现 `deepseek_web/` | 拆为 8 个模块（共约 1987 行）：`config` / `models` / `toolcalls` / `prompting` / `driver` / `streaming` / `server` / `__init__` |
 | OpenAI 兼容 | `/v1/models`、`/v1/chat/completions`（含 SSE 流式）、OpenAI 兼容错误体 |
 | Function Calling | 提示词注入 + 结构化解析模拟 |
 | 会话恢复 | 保存 `user_data/.deepseek_session`，超时后重新进入 |
-| **会话生命周期** | ⬜ **未管理**：所有请求共用一个全局会话，**永不轮转、无上限控制**（见 P0-0） |
+| **会话生命周期** | ✅ 已管理：体积预算自动轮转 + 轮转时**播种**历史 + 到顶检测 + 重试阶梯（见 P0-0） |
+| **按任务隔离会话** | ✅ `X-DeepSeek-Session`（或 `user` 字段）分桶：每个 key 一条独立页面与会话状态；`POST /session/reset` 可手动重置；`SESSION_SCOPING=false` 可回退到全局共用（见 P0-0） |
 | 结束判定 | 内容变化判定本轮回复出现 + 页面生成状态 / 内容稳定双重收尾 |
 | 代码落盘 | 从 DOM `<pre>` 提取代码块并保存 |
 | 可运维 | `GET /healthz`、`HEADLESS`、`DEEPSEEK_TIMEOUT` / `DEEPSEEK_RETRIES` / `DEEPSEEK_DEBUG`、`GET /debug/dom` |
-| 测试 | **54 个用例（stdlib unittest）**，`tests/`（含模块结构 / 向后兼容冒烟） |
+| 测试 | **129 个用例（stdlib unittest）**，`tests/`（含模块结构、会话生命周期、会话分桶与**路由层**） |
 | 依赖声明 | `requirements.txt` 已存在（含 `openai`） |
-| 配置 | `.env` / `.env.example` + `env_str/env_int/env_float/env_bool` 集中读取；DOM 选择器已集中到文件顶部 |
+| 配置 | `.env` / `.env.example` + `env_str/env_int/env_float/env_bool`，全部集中在 `deepseek_web/config.py`（含 DOM 选择器） |
 
 ---
 
 ## 二、P0 — 阻塞正确性 / 可用性
 
-### P0-0 ⬜ 会话无上限增长，且“到顶”会伪装成超时（本次新增，最高优先级）
+### P0-0 ✅ 会话无上限增长，且“到顶”会伪装成超时（最高优先级）
 
 - **现状**：`SESSION_FILE` 只保存**一个**会话地址，启动时 `goto` 它，每轮成功后再把当前地址写回同一个文件 —— **所有请求永远共用同一个网页会话，代码里没有任何新建 / 轮转 / 重置逻辑**。
 - **为何必然增长**：`build_prompt` 只发送「最后一条 assistant 之后」的新增消息，依赖网页端自己保留全部历史。因此**每轮真正喂给模型的上下文 = 整个网页会话的累积历史**，而不是客户端发来的 `messages`。
@@ -67,16 +72,38 @@
 
 **「新开会话」与「播种上下文」必须成对出现。** 没有播种能力之前，任何形式的自动新开会话都是危险的 —— 因为 `build_prompt` 只发增量，新会话里模型收不到任何历史。因此**实现顺序上播种必须先做**。
 
-#### 建议（按性价比排序）
+#### 实现（已完成）
 
-1. **先实现“播种”**：当会话不存在或需要新建时，用客户端完整历史（或摘要）重建上下文，而不是只发最后一条消息。**这是后面所有改动的前提。**
-2. 检测「达到对话长度上限」类文案，返回可区分的 `context_length_exceeded` 错误，而不是让它伪装成超时。
-3. **重试阶梯**：正常 → 恢复同一会话 → **新会话 + 重放历史**（取代现在“三次都在同一个会话上打转”）。
-4. 会话状态从“一个 URL”升级为 `{url, turns, est_tokens, cap_hit, last_failure}`；启动时按状态决定复用还是新建（有了第 1 条，新建才是安全的）。默认仍应复用，以保留跨重启的上下文。
-5. 按任务隔离会话（按 Pi 的 session / thread 标识分桶），不要全局共用一个。
-6. `/healthz` 暴露轮数与估算 token；提供 `POST /session/reset` 或 `DEEPSEEK_NEW_SESSION=1` 作为手动逃生口。
+| # | 内容 | 落地位置 |
+| --- | --- | --- |
+| 1 | **播种**：`build_prompt(..., seed=True)` 重放既有上下文（保留所有 `system`；超出 `SEED_MAX_CHARS` 时从最早的消息开始丢，并明示“已省略”） | `prompting.build_prompt` / `_seed_messages` |
+| 2 | **到顶检测**：周期性检查页面（先剔除回复节点文本避免误报），命中则抛 `DeepSeekContextLimitError` → HTTP **400 `context_length_exceeded`**；超时前也会再确认一次 | `driver._page_shows_context_limit` / `server` |
+| 3 | **重试阶梯**：第 1 级现有会话 → 中间级恢复**同一个**会话 → **最高一级换新会话 + 播种** | `driver.send_chat` |
+| 4 | **会话状态**：`user_data/.deepseek_session` 从“一个 URL”升级为 JSON `{url, turns, est_tokens, cap_hit, last_error, updated_at}`；**仍能读旧的纯 URL 格式**；超 `SESSION_MAX_TURNS` / `SESSION_MAX_TOKENS` 时下一轮自动轮转 | `driver._load/_save_session_state` |
+| 5 | **可观测与逃生口**：`/healthz` 新增 `session`（`turns` / `est_tokens` / `cap_hit` / `pending_rotation` / `needs_seed` / `buckets`）；`DEEPSEEK_NEW_SESSION=true` 启动即开新会话 | `server` / `config` |
+| 6 | **按任务隔离会话**：`X-DeepSeek-Session`（可用 `SESSION_KEY_HEADER` 改名，`user` 字段兜底）把请求映射到会话桶；**每个桶持有独立页面 + 独立状态**，互不污染上下文；默认桶仍用 `self.page`，旧调用/旧测试行为不变；桶数上限 `MAX_SESSION_BUCKETS`（默认 8），key 消毒后限长 `SESSION_KEY_MAX_LEN`；`SESSION_SCOPING=false` 可整体关闭 | `server._session_key` / `driver._state` / `_ensure_page` |
+| 7 | **手动逃生口**：`POST /session/reset[?session=<key>]` 让指定桶的下一轮开新会话（**仍会播种历史**，不丢上下文），返回该桶状态快照 | `server.reset_session` / `driver.reset_session` |
 
-- **测试思路**：会话轮转、“到顶”检测与播种策略都能用假 page 覆盖，与 `tests/test_end_detection.py` 同一套路，无需真实浏览器。
+#### 会话状态文件格式（兼容历史）
+
+```jsonc
+{
+  "url": "https://chat.deepseek.com/a/chat/s/...",   // 默认桶：字段仍在顶层
+  "turns": 12, "est_tokens": 3456, "cap_hit": false,
+  "pending_rotation": false, "last_error": null, "updated_at": 1790900000,
+  "sessions": {                                      // 其余会话桶
+    "pi-task-1": { "url": "...", "turns": 3, ... }
+  }
+}
+```
+
+旧文件（顶层单会话对象、乃至仅一个 URL 纯文本）仍能读；默认桶永远是顶层，所以历史行为与旧测试无需改动。
+
+- **测试**：
+  - `tests/test_session_lifecycle.py`（22 例）用假 page 驱动播种 / 到顶 / 状态兼容 / 体积轮转 / 重试阶梯 / SSE 错误类型；
+  - `tests/test_multi_session.py`（19 例）覆盖分桶状态隔离、顶层格式不变、惰性创建页面并回到旧会话、桶数上限、`reset_session` 后的“轮转 + 播种”、`_session_key` 的取值优先级与消毒；
+  - `tests/test_routes.py`（21 例）覆盖路由层：参数校验、错误映射（400/502/503/504）、会话 key 透传、流式分支与 `/session/reset`、`/healthz`。
+- **已知小瑕疵**：`server.chat_completions` 里那句 `400 需要包含至少一条 user / tool 消息` 实际是**死分支** —— 只要 `messages` 非空，`build_prompt` 的播种分支总能产出内容，所以永远不会命中。已用测试钉住当前行为（只发 system 消息也会正常返回 200），留着不影响正确性。
 
 ### 1. ✅ `requirements.txt` 缺失，`INSTALL.md` 与 README 的命令跑不通
 - **结论**：已修复。`requirements.txt` 存在且包含 `fastapi / uvicorn / playwright / pydantic / openai`；`README` 与 `INSTALL.md` 均改为 `pip install -r requirements.txt`。
@@ -84,7 +111,7 @@
 
 ### 2. ✅ 超时被硬改为 60s，与 README 矛盾
 - **结论**：已修复，且采用的正是初版建议的方案。
-- **现状**：`RESPONSE_TIMEOUT_S = float(os.environ.get("DEEPSEEK_TIMEOUT", "180"))`。
+- **现状**：`RESPONSE_TIMEOUT_S = env_float("DEEPSEEK_TIMEOUT", 180)`（位于 `deepseek_web/config.py`）。
 - **补充约束（重要）**：该值**必须小于 Pi 侧 HTTP 客户端的超时**，否则客户端会先报错，服务端的兜底反而变成负担。
 
 ### 3. 🔶 流式与非流式对 `tool_calls` 的处理不一致
@@ -102,7 +129,7 @@
 ## 三、P1 — 健壮性
 
 ### 5. ✅ 选择器全硬编码、无集中管理
-- **现状**：`RESPONSE_SELECTORS` / `INPUT_SELECTORS` / `READY_SELECTOR` / `CODE_BLOCK_SELECTOR` / `CODE_TAG_SELECTOR` 集中定义在文件顶部；README 的"选择器适配"一节点明只需改这一处。
+- **现状**：`RESPONSE_SELECTORS` / `INPUT_SELECTORS` / `READY_SELECTOR` / `CODE_BLOCK_SELECTOR` / `CODE_TAG_SELECTOR` 集中定义在 `deepseek_web/config.py`；README 的"选择器适配"一节点明只需改这一处。
 - **已增强**：这些选择器现在都可用 `.env` 覆盖而无需改代码（`INPUT_SELECTORS` 用 `||` 分隔多个候选）。
 - **剩余可选**：如需进一步拆成独立模块，见 P2-11。
 
@@ -152,15 +179,19 @@
 - **注意**：拆分本身就是纯重构，已由 P2-12 的测试 + AST 对拍保住行为不变。
 
 ### 12. ✅ 零测试
-- **现状**：`tests/` 下 46 个用例，全部使用**标准库 `unittest`**（不引入 pytest，零新依赖）：
+- **现状**：`tests/` 下 **129 个用例**，全部使用**标准库 `unittest`**（不引入 pytest，零新依赖）：
   - `tests/test_parsing.py`：`_content_to_text`、`estimate_tokens`、`_delta_piece`、`_iter_balanced_objects`、`parse_tool_calls`（围栏 / 无围栏 / 多个调用 / 字符串含 `}` / 转义引号 / 合法名过滤）、`build_prompt` 增量逻辑、`to_tool_call_models`、请求模型宽松校验；
-  - `tests/test_end_detection.py`：用假 page 驱动 `_send_chat_locked`，覆盖节点数恒定、流式增长后静止、停止按钮出现又消失、内容未变时不返回旧答案、超时返回已读内容不重发、增量可还原全文。
+  - `tests/test_end_detection.py`：用假 page 驱动 `_send_chat_locked`，覆盖节点数恒定、流式增长后静止、停止按钮出现又消失、内容未变时不返回旧答案、超时返回已读内容不重发、增量可还原全文；
+  - `tests/test_session_lifecycle.py`：播种（含截断与保留 system）、到顶检测、会话状态往返与旧格式兼容、体积预算轮转、重试阶梯（同级恢复 vs 换新会话）、SSE 错误类型与 `[DONE]` 收尾；
+  - `tests/test_multi_session.py`：会话分桶的状态隔离、默认桶仍在文件顶层、惰性建页并回到旧会话、桶数上限、`reset_session` 后的“轮转 + 播种”、`_session_key` 取值优先级与消毒；
+  - `tests/test_routes.py`：路由层（参数校验、错误映射、key 透传、流式分支、`/session/reset`、`/healthz`）；
+  - `tests/test_package_layout.py`：重导出名字（含新公开名）、config 类型、`.env` 指向项目根、`.env.example` 覆盖所有配置项、路由存在。
 - **运行**：`.venv/bin/python -m unittest discover -s tests -t . -v`
-- **剩余可选**：路由层（FastAPI）尚未覆盖，需要 mock driver 或 httpx 的 `ASGITransport`（当前环境未安装 httpx）。
+- **已补齐（本次）**：`tests/test_routes.py`（21 例）覆盖路由层。因为环境里没有 httpx、装不了 starlette 的 `TestClient`，改为**直接 await 路由函数**并用假 driver 替换 `deepseek_web.server.driver` 单例；覆盖参数校验、错误映射、会话 key 透传、流式分支、`/session/reset`、`/healthz`。若以后引入 httpx，可在此基础上补一层真正的 ASGI 传输测试。
 
-### 13. 🔶 未使用字段 / 代码重叠
+### 13. ✅ 未使用字段 / 代码重叠
 - **已完成**：README 明确标注 `temperature` / `top_p` / `max_tokens` / `stop` **接收但不生效**。
-- **剩余可选**：`deepseek_agent.py` 与 Driver 功能重叠，可标注为"独立示例"或合并复用解析/落盘逻辑。
+- **已解决（本次）**：`deepseek_agent.py` **已删除**。它是早期的单文件脚本，与 `deepseek_web` 功能重叠、无测试覆盖，且新能力一律应该落到包内；保留一份“不走 API、直接驱动网页版”的代码只会带来两套实现漂移的风险。需要时可在 git 历史里找回（`git show <commit>:deepseek_agent.py`）。
 
 ### 14. ✅ `cmdlog.md` 与实际依赖不一致
 - **现状**：已改为 `uv pip install -r requirements.txt`，并补上运行与测试命令。
@@ -186,18 +217,18 @@
 2. 启发式逻辑必须配回归测试，本次已补齐；
 3. 未验证的"看起来更宽容"的参数改动（如把超时 60s→300s）会放大既有故障，改动前应先确认失效路径；
 4. **多种失败原因会收敛到同一个症状（超时）**。凡是复用外部会话/进程的地方，都要把"上游明确拒绝"与"上游无响应"区分开，否则排查成本极高。
+5. **给单例对象加字段前先问一句：它到底属于“进程”还是“任务”？** 本项目的 driver 是全局单例，而 `session_has_history` / `turns` / `cap_hit` / `pending_rotation` 全是“任务级”状态。它们写死在单例上时，多任务必然互相覆盖；本次把它们收进 `SessionState` 并按桶存放，同时用**属性代理**保住默认桶的旧用法，所以 88 个旧用例一个都不用改就能迁到分桶模型上。
 
 ---
 
 ## 六、建议的落地顺序（仅剩未完成项）
 
-1. **P0-0 第 1 步**：会话播种（所有轮转功能的**前置依赖**）。
-2. **P0-0 第 2 步**：到顶检测（改动小、直接消掉“伪超时”）。
-3. **P0-0 第 3 步**：重试阶梯改为“最后一级换新会话 + 重放历史”。
-4. **P0-0 第 4 步**：会话状态持久化 + 基于体积的轮转。
-5. **P2-12 剩余** 路由层测试（可选引入 httpx / mock driver）。
-6. **P2-13 剩余** 处理 `deepseek_agent.py` 的功能重叠。
-7. **P1-10 剩余** 如需更准的 usage，接入 DeepSeek 自己的分词器（而非 tiktoken）。
+已完成全部 P0；P1/P2 只剩下列低优先级项：
+
+1. **P1-10 剩余** 如需更准的 usage，接入 DeepSeek 自己的分词器（而非 tiktoken）。当前保持“明确标注为估算”的近似公式。
+2. **P2-12 可选加强** 引入 httpx 后，用 `ASGITransport` 把路由测试升级成真正的 ASGI 端到端（现在是直接 await 路由函数）。
+3. **可选** 会话桶的**持久化回收**：目前桶只增不减（上限 `MAX_SESSION_BUCKETS` 后拒绝新建），可加一条空闲超时后自动回收。
+4. ~~`deepseek_agent.py` 的处置~~ —— 已删除（见 P2-13）。
 
 ---
 
@@ -214,11 +245,12 @@
 - [x] 新增 `tests/test_parsing.py` 与 `tests/test_end_detection.py`
 - [x] README 标注"temperature 等字段接收但不生效"
 - [x] 错误响应改为 OpenAI 兼容结构 + 区分可重试/不可重试
-- [ ] **会话播种**（新会话时用完整历史 / 摘要重建上下文）——其余轮转项的前置
-- [ ] 检测「达到对话长度上限」并返回可区分的 `context_length_exceeded` 错误
-- [ ] 重试阶梯最后一级改为“新会话 + 重放历史”
-- [ ] 会话自动轮转（轮数 / token 阈值 + 摘要播种）
-- [ ] 按任务隔离会话；`/healthz` 暴露会话轮数与估算 token
-- [ ] `POST /session/reset` / `DEEPSEEK_NEW_SESSION=1` 手动逃生口
+- [x] **会话播种**（新会话时用完整历史 / 摘要重建上下文）——其余轮转项的前置
+- [x] 检测「达到对话长度上限」并返回可区分的 `context_length_exceeded` 错误
+- [x] 重试阶梯最后一级改为“新会话 + 重放历史”
+- [x] 会话自动轮转（轮数 / token 阈值 + 播种）
+- [x] 按任务隔离会话（`X-DeepSeek-Session` 分桶）；`/healthz` 暴露会话轮数与估算 token
+- [x] `POST /session/reset` / `DEEPSEEK_NEW_SESSION=1` 手动逃生口
 - [x] 拆分单文件为多模块（`deepseek_web` 包 + 薄入口）
-- [ ] 补路由层测试
+- [x] 补路由层测试（不依赖 httpx，直接 await 路由函数 + 假 driver）
+- [ ] 会话桶的空闲回收（目前只增不减，达上限后拒绝新建）

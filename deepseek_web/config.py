@@ -107,6 +107,37 @@ MAX_UPSTREAM_RETRIES = env_int("DEEPSEEK_RETRIES", 2)
 RETRY_BACKOFF_S = env_float("RETRY_BACKOFF_S", 1.0)
 
 
+# ==================== 会话生命周期 ====================
+# 启动时忽略已保存的会话，直接开一个新会话。搭配“播种”使用才安全（首轮会重放历史）。
+NEW_SESSION_ON_START = env_bool("DEEPSEEK_NEW_SESSION")
+# 「会话到顶」提示语的匹配规则（"||" 分隔多条正则，大小写不敏感）。
+# 网页版到顶时会弹提示并停止响应，必须能与“真的卡住”区分开。
+CAP_NOTICE_PATTERNS = [
+    p.strip()
+    for p in env_str(
+        "CAP_NOTICE_PATTERNS",
+        "达到对话长度上限||对话长度上限||已达到长度限制||达到长度限制||"
+        "开启新对话||开始新的聊天||context length limit||start a new chat",
+    ).split("||")
+    if p.strip()
+]
+# 每 N 轮轮询检查一次“是否到顶”（避免每轮都对整页做 innerText 扫描）
+CAP_CHECK_EVERY = env_int("CAP_CHECK_EVERY", 4)
+# 「按任务隔离会话」使用的请求头：同一取值的请求共用一条网页会话，
+# 不同取值各自维护独立的会话状态与页面（互不污染上下文）。
+SESSION_KEY_HEADER = env_str("SESSION_KEY_HEADER", "X-DeepSeek-Session")
+# 关闭后所有请求共用默认会话（旧行为）
+SESSION_SCOPING = env_bool("SESSION_SCOPING", True)
+# 单个 key 的长度上限（防止超长头部变成文件名/JSON 键）
+SESSION_KEY_MAX_LEN = env_int("SESSION_KEY_MAX_LEN", 64)
+MAX_SESSION_BUCKETS = env_int("MAX_SESSION_BUCKETS", 8)
+# 播种（新会话时重放历史）的最大字符数预算；超出时保留最近的消息
+SEED_MAX_CHARS = env_int("SEED_MAX_CHARS", 12000)
+# 网页会话超过以下任一阈值后，下一轮自动轮转到新会话（0 表示禁用该维度）
+SESSION_MAX_TURNS = env_int("SESSION_MAX_TURNS", 60)
+SESSION_MAX_TOKENS = env_int("SESSION_MAX_TOKENS", 60000)
+
+
 # ==================== DOM 选择器 ====================
 # 统一集中在这里，网页版改版时只需改这一处（也可用 .env 覆盖而无需改代码）。
 # 回复节点的候选选择器

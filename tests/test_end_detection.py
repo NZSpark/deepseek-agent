@@ -123,7 +123,7 @@ class ConstantNodeCountTests(EndDetectionTestCase):
         sent = []
         original = driver._send_chat_locked
 
-        async def counting(prompt, on_delta=None):
+        async def counting(prompt, on_delta=None, **kwargs):
             sent.append(prompt)
             return await original(prompt, on_delta)
 
@@ -167,7 +167,7 @@ class StabilityTests(EndDetectionTestCase):
         sent = []
         original = driver._send_chat_locked
 
-        async def counting(prompt, on_delta=None):
+        async def counting(prompt, on_delta=None, **kwargs):
             sent.append(prompt)
             return await original(prompt, on_delta)
 
