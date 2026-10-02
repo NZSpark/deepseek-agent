@@ -137,6 +137,50 @@ class ParseToolCallsTests(unittest.TestCase):
     def test_tool_call_without_json_is_ignored(self):
         self.assertEqual(srv.parse_tool_calls("tool_call 这里没有 JSON"), [])
 
+    def test_dsml_tool_uses_wrapper(self):
+        """网页版偶发的 DSML 风格 XML：<｜｜DSML｜｜ calls> + tool_uses 数组。"""
+        text = (
+            '<｜｜DSML｜｜ calls>\n'
+            '{"tool_uses": [{"name": "exec_command", '
+            '"arguments": {"cmd": "ls -la"}}]}\n'
+            '</｜｜DSML｜｜ parameter>\n'
+            '</｜｜DSML｜｜ invoke>\n'
+            '</｜｜DSML｜｜ calls>'
+        )
+        calls = srv.parse_tool_calls(text)
+        self.assertEqual(
+            calls, [{"name": "exec_command", "arguments": {"cmd": "ls -la"}}]
+        )
+
+    def test_dsml_multiple_tool_uses(self):
+        text = (
+            '<｜｜DSML｜｜ calls>\n'
+            '{"tool_uses": ['
+            '{"name": "exec_command", "arguments": {"cmd": "a"}}, '
+            '{"name": "exec_command", "arguments": {"cmd": "b"}}]}\n'
+            '</｜｜DSML｜｜ calls>'
+        )
+        calls = srv.parse_tool_calls(text)
+        self.assertEqual([c["arguments"]["cmd"] for c in calls], ["a", "b"])
+
+    def test_bare_tool_uses_without_wrapper(self):
+        """标签丢失、只剩 {"tool_uses": [...]} 的裸对象。"""
+        text = '{"tool_uses": [{"name": "read", "arguments": {"path": "a"}}]}'
+        calls = srv.parse_tool_calls(text)
+        self.assertEqual(calls, [{"name": "read", "arguments": {"path": "a"}}])
+
+    def test_dsml_valid_names_filter(self):
+        text = (
+            '<｜｜DSML｜｜ calls>\n'
+            '{"tool_uses": [{"name": "exec_command", "arguments": {"cmd": "ls"}}]}\n'
+            '</｜｜DSML｜｜ calls>'
+        )
+        self.assertEqual(srv.parse_tool_calls(text, {"bash"}), [])
+        self.assertEqual(
+            srv.parse_tool_calls(text, {"exec_command"}),
+            [{"name": "exec_command", "arguments": {"cmd": "ls"}}],
+        )
+
 
 class BuildPromptTests(unittest.TestCase):
     @staticmethod

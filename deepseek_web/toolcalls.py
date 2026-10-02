@@ -17,6 +17,15 @@ from .models import FunctionCall, ToolCall
 _TOOL_CALL_FENCE_RE = re.compile(r"```(tool[-_]call)\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 # "json" 围栏仅在内容明显是工具调用时才采纳（兜底，兼容模型不听话的情况）
 _JSON_FENCE_RE = re.compile(r"```json\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+# 网页版偶尔会输出 DSML 风格的工具调用 XML（全角竖线 ｜｜ 包裹的标签），
+# 形如： <｜｜DSML｜｜ calls>{"tool_uses": [...]}</｜｜DSML｜｜ calls>
+# 这里只取标签之间的 JSON 对象，交由 _consume 解析。
+_DSML_TOOL_RE = re.compile(
+    r"<\s*[｜|]{2}\s*DSML\s*[｜|]{2}[^>]*>(.*?)<\s*/\s*[｜|]{2}\s*DSML\s*[｜|]{2}",
+    re.DOTALL | re.IGNORECASE,
+)
+# 无标签但带 "tool_uses" 键的裸 JSON 对象（DOM 提取后标签可能丢失）
+_TOOL_USES_RE = re.compile(r"tool_uses\s*\"?\s*:", re.IGNORECASE)
 
 
 def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
@@ -132,6 +141,9 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
             return
         if isinstance(data, dict) and isinstance(data.get("tool_calls"), list):
             entries = data["tool_calls"]
+        elif isinstance(data, dict) and isinstance(data.get("tool_uses"), list):
+            # DSML / 部分网页版形态：键名是 tool_uses
+            entries = data["tool_uses"]
         elif isinstance(data, list):
             entries = data
         elif isinstance(data, dict):
@@ -149,8 +161,20 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
         _consume(match.group(2), allow_bare_object=True)
 
     if not calls:
+        # DSML 风格 XML 包裹的工具调用（网页版偶发输出）
+        for match in _DSML_TOOL_RE.finditer(text):
+            _consume(match.group(1), allow_bare_object=True)
+
+    if not calls:
         for match in _JSON_FENCE_RE.finditer(text):
             _consume(match.group(1), allow_bare_object=True)
+
+    if not calls and _TOOL_USES_RE.search(text):
+        # 标签丢失、只剩 {"tool_uses": [...]} 的裸对象
+        for obj in _iter_balanced_objects(text):
+            _consume(obj, allow_bare_object=True)
+            if calls:
+                break
 
     if not calls:
         # 兜底：无围栏的 "tool_call" 标签 + 平衡 JSON 对象（网页 DOM 提取后的形态）
