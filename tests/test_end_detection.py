@@ -77,18 +77,19 @@ class FakePage:
 
 class EndDetectionTestCase(unittest.TestCase):
     def setUp(self):
-        # 避免真实读取/写入 user_data/.deepseek_session
+        # 注意：可调参数现在集中在 deepseek_web.config，运行期按属性读取，
+        # 因此必须 patch 真正的定义处（srv.config），patch 入口模块的重导出名字不会生效。
         self._tmp_session = Path(self.id().replace(".", "_") + ".session")
-        patch = unittest.mock.patch.object(srv, "SESSION_FILE", self._tmp_session)
+        patch = unittest.mock.patch.object(srv.config, "SESSION_FILE", self._tmp_session)
         patch.start()
         self.addCleanup(patch.stop)
         self.addCleanup(lambda: self._tmp_session.exists() and self._tmp_session.unlink())
 
-        self._patch_poll = unittest.mock.patch.object(srv, "POLL_INTERVAL_S", 0)
+        self._patch_poll = unittest.mock.patch.object(srv.config, "POLL_INTERVAL_S", 0)
         self._patch_poll.start()
         self.addCleanup(self._patch_poll.stop)
 
-        self._patch_timeout = unittest.mock.patch.object(srv, "RESPONSE_TIMEOUT_S", 5.0)
+        self._patch_timeout = unittest.mock.patch.object(srv.config, "RESPONSE_TIMEOUT_S", 5.0)
         self._patch_timeout.start()
         self.addCleanup(self._patch_timeout.stop)
 
@@ -149,8 +150,8 @@ class StabilityTests(EndDetectionTestCase):
 
     def test_unchanged_content_is_not_reported_as_the_reply(self):
         page = FakePage(baseline=["旧答案"], script=[["旧答案"]])
-        with unittest.mock.patch.object(srv, "RESPONSE_TIMEOUT_S", 0.05):
-            with unittest.mock.patch.object(srv, "MAX_UPSTREAM_RETRIES", 1):
+        with unittest.mock.patch.object(srv.config, "RESPONSE_TIMEOUT_S", 0.05):
+            with unittest.mock.patch.object(srv.config, "MAX_UPSTREAM_RETRIES", 1):
                 with self.assertRaises(srv.DeepSeekTimeoutError):
                     self.run_chat(self.driver_for(page))
 
@@ -171,7 +172,7 @@ class StabilityTests(EndDetectionTestCase):
             return await original(prompt, on_delta)
 
         driver._send_chat_locked = counting
-        with unittest.mock.patch.object(srv, "RESPONSE_TIMEOUT_S", 0.05):
+        with unittest.mock.patch.object(srv.config, "RESPONSE_TIMEOUT_S", 0.05):
             text, _ = self.run_chat(driver)
         self.assertTrue(text.startswith("ans"))
         self.assertEqual(len(sent), 1)

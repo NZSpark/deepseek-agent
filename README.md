@@ -23,13 +23,22 @@
 
 ```
 .
-├── deepseek_api_server.py   # 核心：FastAPI 服务 + OpenAI 兼容层 + 浏览器 Driver
+├── deepseek_api_server.py   # 入口（薄封装）：重新导出历史公开名字并启动服务
+├── deepseek_web/            # 真正的实现
+│   ├── config.py            #   .env 加载 + 全部可调参数（超时 / 重试 / 选择器 / 路径）
+│   ├── models.py            #   OpenAI 兼容的 Pydantic 数据模型
+│   ├── toolcalls.py         #   工具注入与解析（模拟 function calling）
+│   ├── prompting.py         #   消息数组 -> 网页输入框文本
+│   ├── driver.py            #   Playwright 浏览器 Driver + 会话持久化
+│   ├── streaming.py         #   SSE 流式编码
+│   └── server.py            #   FastAPI 应用与路由
 ├── deepseek_agent.py        # 独立的 Playwright 脚本示例（脱离 API，直接驱动网页对话）
 ├── client_test.py           # 使用官方 openai SDK 测试本地服务的示例客户端
 ├── requirements.txt         # 运行时依赖（含 client_test.py 需要的 openai）
+├── .env.example             # 配置模板（复制为 .env）
 ├── INSTALL.md               # 安装说明
 ├── cmdlog.md                # 环境搭建 / 运行 / 测试命令备忘
-├── tests/                   # 解析层与结束判定的回归测试（stdlib unittest）
+├── tests/                   # 解析层、结束判定与模块结构的回归测试（stdlib unittest）
 ├── doc/update.md            # 项目改进建议与进度
 ├── output/                  # 自动提取的代码 / 回复文件输出目录
 ├── user_data/               # Chromium 持久化用户目录（保存登录态，勿提交到 git）
@@ -163,7 +172,8 @@ DeepSeek 网页版不支持原生 function calling，本项目采用三步模拟
 ## ⚙️ 使用技巧与注意事项
 
 - **保持浏览器窗口打开**：服务依赖浏览器实例，请不要关闭自动弹出的 Chromium 窗口。
-- **选择器适配**：网页版改版时只需改文件顶部集中定义的 `RESPONSE_SELECTORS` / `INPUT_SELECTORS` / `READY_SELECTOR` / `CODE_BLOCK_SELECTOR`。
+- **选择器适配**：网页版改版时只需改 [`deepseek_web/config.py`](deepseek_web/config.py) 里集中定义的 `RESPONSE_SELECTORS` / `INPUT_SELECTORS` / `READY_SELECTOR` / `CODE_BLOCK_SELECTOR`（也可直接用 `.env` 覆盖，不改代码）。
+- **改代码后注意**：所有可调参数都在 [`deepseek_web/config.py`](deepseek_web/config.py)，运行期按 `config.<NAME>` 取属性；因此改写入口模块 `deepseek_api_server.RESPONSE_TIMEOUT_S` 之类**不会生效**，请改 `.env` 或 `deepseek_web.config` 模块属性。
 - **结束判定**：以「最后一条回复的内容是否变化」判断本轮回复是否出现（**不能用回复节点数量**：长会话下 DeepSeek 会回收/替换节点，数量可能恒定不变，实测恒为 2）。结束后先用页面「生成中」状态收尾，识别不到该控件时退回内容稳定判定（文本相同连续 2 次，或长度不再增长连续 4 次）。
 - **超时**：单轮生成总超时默认 180 秒，可用环境变量 `DEEPSEEK_TIMEOUT` 覆盖（必须小于 Pi 侧 HTTP 客户端的超时，否则客户端会先报错）。若超时前已读到回复内容，会直接返回该内容而**不重发**；只有页面上完全没有产生新回复时才视为发送失败，恢复会话后重试一次。客户端建议设置较长 timeout（`client_test.py` 中为 240s）。
 - **重试**：只有「等待超时」才会重试，最多 `DEEPSEEK_RETRIES` 次（默认 2），每次先尝试恢复会话再退避重试；找不到输入框、profile 被占用等属于不可重试，直接返回错误。

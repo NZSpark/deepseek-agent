@@ -1,0 +1,115 @@
+"""把客户端的消息数组转换成网页输入框里的一整段文本，以及若干纯文本工具函数。"""
+
+from typing import Any, Dict, List, Optional
+
+from .models import ChatMessage
+from .toolcalls import format_tools_instruction
+
+
+def _content_to_text(content: Any) -> str:
+    """把 OpenAI 的 content 归一化为纯文本。
+
+    content 可能是：
+      - None
+      - 字符串
+      - 内容分片数组，例如 [{"type": "text", "text": "hi"}]
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        pieces: List[str] = []
+        for part in content:
+            if isinstance(part, str):
+                pieces.append(part)
+            elif isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str):
+                    pieces.append(text)
+        return "\n".join(pieces)
+    if isinstance(content, dict):
+        text = content.get("text")
+        return text if isinstance(text, str) else ""
+    return str(content)
+
+
+def estimate_tokens(text: str) -> int:
+    """估算 token 数（仅用于填充 OpenAI 的 usage 字段，不是精确值）。
+
+    CJK 字符约 1 char/token，其余字符约 4 char/token。
+    不引入 tiktoken：那是 OpenAI 的分词器，算 DeepSeek 的 token 只会
+    得到一个“看起来很精确但其实是错的”数字，反而更容易误导客户端做上下文裁剪。
+    """
+    if not text:
+        return 0
+    cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff" or "\u3000" <= ch <= "\u30ff")
+    other = len(text) - cjk
+    return max(1, cjk + other // 4)
+
+
+def _delta_piece(streamed: str, current: str) -> tuple[Optional[str], str]:
+    """计算 ``current`` 相对「已经发给客户端的内容」真正新增的部分。
+
+    网页版在生成中可能重排 / 替换回复节点，导致 ``current`` 不再以之前的内容为前缀。
+    此时不能用简单的 ``startswith`` 判定（会静默丢字），也不应从头发一遍
+    （会重复）。这里退回「公共前缀之后的部分」。
+
+    :return: (需要补发的内容, 客户端补发后实际拥有的内容)；无新增时第一项为 None。
+    """
+    if current == streamed:
+        return None, streamed
+    if current.startswith(streamed):
+        return current[len(streamed):], current
+    limit = min(len(streamed), len(current))
+    index = 0
+    while index < limit and streamed[index] == current[index]:
+        index += 1
+    piece = current[index:] or None
+    return piece, streamed[:index] + (piece or "")
+
+
+def build_prompt(
+    messages: List[ChatMessage],
+    tools: Optional[List[Dict[str, Any]]] = None,
+    tool_choice: Optional[Any] = None,
+) -> str:
+    """把客户端发来的完整 OpenAI 消息数组，转换成要发给网页输入框的文本。
+
+    网页版是一个持续存在的会话，因此无需每轮重发全部历史：
+    只发送“最后一条 assistant 消息之后”的新增消息（新的 user 指令或 tool 结果）。
+    """
+    last_assistant = -1
+    for index, message in enumerate(messages):
+        if message.role == "assistant":
+            last_assistant = index
+
+    if last_assistant >= 0:
+        delta = messages[last_assistant + 1:]
+    else:
+        delta = messages
+
+    if not delta:
+        # 兜底：没有新消息时，退回最后一条 user 消息
+        delta = [m for m in messages if m.role == "user"][-1:]
+
+    parts: List[str] = []
+    for message in delta:
+        content = _content_to_text(message.content).strip()
+        if message.role == "system":
+            parts.append(f"[系统指令]\n{content}")
+        elif message.role == "tool":
+            tag = f" {message.tool_call_id}" if message.tool_call_id else ""
+            parts.append(f"[工具执行结果{tag}]\n{content}")
+        elif message.role == "assistant":
+            parts.append(f"[你之前的回复]\n{content}")
+        elif content:
+            parts.append(content)
+
+    prompt = "\n\n".join(part for part in parts if part).strip()
+
+    use_tools = bool(tools) and tool_choice != "none"
+    if use_tools:
+        prompt = (prompt + "\n\n" + format_tools_instruction(tools)).strip()
+
+    return prompt
