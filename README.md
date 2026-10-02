@@ -8,7 +8,8 @@
 
 ## ✨ 特性
 
-- **OpenAI 兼容接口**：完整实现 `/v1/models` 与 `/v1/chat/completions`，支持 `messages`、`tools`、`stream` 等标准字段。
+- **OpenAI 兼容接口**：完整实现 `/v1/models` 与 `/v1/chat/completions`，支持 `messages`、`tools`、`stream` 等标准字段；错误也以 OpenAI 兼容的 `error` 结构返回。
+- **可运维**：`GET /healthz` 健康检查、`HEADLESS` 无头模式、`/debug/dom` DOM 诊断端点。
 - **流式响应（SSE）**：以 `text/event-stream` 逐字吐出内容，兼容 OpenAI 流式解析器。
 - **模拟 Function Calling**：网页版本身不支持 function calling，本项目通过「提示词注入 + 结构化解析」模拟出 OpenAI 的 `tool_calls` 语义。
 - **代码块自动落盘**：直接从网页 DOM 的 `<pre><code>` 提取代码，自动按语言保存为 `.py` / `.js` / `.json` 等文件到 `output/`。
@@ -25,7 +26,11 @@
 ├── deepseek_api_server.py   # 核心：FastAPI 服务 + OpenAI 兼容层 + 浏览器 Driver
 ├── deepseek_agent.py        # 独立的 Playwright 脚本示例（脱离 API，直接驱动网页对话）
 ├── client_test.py           # 使用官方 openai SDK 测试本地服务的示例客户端
-├── cmdlog.md                # 环境搭建命令备忘
+├── requirements.txt         # 运行时依赖（含 client_test.py 需要的 openai）
+├── INSTALL.md               # 安装说明
+├── cmdlog.md                # 环境搭建 / 运行 / 测试命令备忘
+├── tests/                   # 解析层与结束判定的回归测试（stdlib unittest）
+├── doc/update.md            # 项目改进建议与进度
 ├── output/                  # 自动提取的代码 / 回复文件输出目录
 ├── user_data/               # Chromium 持久化用户目录（保存登录态，勿提交到 git）
 └── .venv/                   # Python 虚拟环境
@@ -40,11 +45,11 @@
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-uv pip install playwright fastapi uvicorn
+uv pip install -r requirements.txt
 playwright install chromium
 ```
 
-> 若未安装 `uv`，可将 `uv pip install ...` 替换为 `pip install ...`。
+> 若未安装 `uv`，可将 `uv pip install ...` 替换为 `pip install ...`。依赖统一以 `requirements.txt` 为准。
 
 ### 2. 启动服务
 
@@ -110,7 +115,11 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 | `save_files` | bool | **本地扩展**，是否把提取到的代码落盘，默认 `true` |
 | `output_dir` | string | **本地扩展**，输出目录，默认 `./output` |
 
-其余标准字段（`temperature`、`top_p`、`max_tokens`、`stream_options.include_usage` 等）均会被接收，未知字段也不会报错。
+其余标准字段（`reasoning_effort`、未知字段等）均会被接收，不会返回 422。
+
+> ⚠️ 网页版无法控制生成参数，因此 `temperature` / `top_p` / `max_tokens` / `stop` 会被接收但**不生效**（仅作兼容占位）；`stream_options.include_usage` 有效，会在流末尾附上 usage。
+
+**错误响应**：返回 OpenAI 兼容的 `{"error": {"message", "type", "code"}}`，而不是裸字符串。`timeout` → 504，上游浏览器不可用 → 502，请求非法 → 400。
 
 **非流式响应示例**
 
@@ -154,12 +163,27 @@ DeepSeek 网页版不支持原生 function calling，本项目采用三步模拟
 ## ⚙️ 使用技巧与注意事项
 
 - **保持浏览器窗口打开**：服务依赖浏览器实例，请不要关闭自动弹出的 Chromium 窗口。
-- **选择器适配**：网页版 DOM 结构变化可能导致输入框/回复块选择器失效，相关选择器集中在 `DeepSeekWebDriver.send_chat` 中，便于维护。
-- **结束判定**：优先依据页面「生成中」状态——一旦观测到「停止生成」控件又发现其消失，立即判定生成结束；检测不到该控件时，退回「内容（忽略首尾空白）连续两次不变」的兜底判定。
+- **选择器适配**：网页版改版时只需改文件顶部集中定义的 `RESPONSE_SELECTORS` / `INPUT_SELECTORS` / `READY_SELECTOR` / `CODE_BLOCK_SELECTOR`。
+- **结束判定**：以「最后一条回复的内容是否变化」判断本轮回复是否出现（**不能用回复节点数量**：长会话下 DeepSeek 会回收/替换节点，数量可能恒定不变，实测恒为 2）。结束后先用页面「生成中」状态收尾，识别不到该控件时退回内容稳定判定（文本相同连续 2 次，或长度不再增长连续 4 次）。
 - **超时**：单轮生成总超时默认 180 秒，可用环境变量 `DEEPSEEK_TIMEOUT` 覆盖（必须小于 Pi 侧 HTTP 客户端的超时，否则客户端会先报错）。若超时前已读到回复内容，会直接返回该内容而**不重发**；只有页面上完全没有产生新回复时才视为发送失败，恢复会话后重试一次。客户端建议设置较长 timeout（`client_test.py` 中为 240s）。
-- **诊断**：`DEEPSEEK_DEBUG=1` 启动后，每轮轮询都会打印节点数 / 文本长度 / 稳定计数 / 生成状态，可直接看出结束判定是否生效；`GET /debug/dom` 会返回页面上真实的回复节点与疑似停止按钮控件结构。
+- **重试**：只有「等待超时」才会重试，最多 `DEEPSEEK_RETRIES` 次（默认 2），每次先尝试恢复会话再退避重试；找不到输入框、profile 被占用等属于不可重试，直接返回错误。
+- **无头运行**：已登录过之后可用 `HEADLESS=1` 启动（适合 CI / 无显示环境）；首次登录必须有头模式。
+- **健康检查**：`GET /healthz` 返回浏览器是否就绪、当前会话地址与初始化错误，便于客户端探活。
+- **诊断**：`DEEPSEEK_DEBUG=1` 启动后，每轮轮询都会打印节点数 / 文本长度 / 稳定计数 / 生成状态，可直接看出结束判定是否生效；`GET /debug/dom` 会返回页面上真实的回复节点（含 class / 长度 / sha1）与疑似停止按钮控件结构。
+- **流式语义**：不带 `tools` 时边生成边吐字；带 `tools` 时必须先缓冲完整回复才能判断是不是 `tool_calls`，因此调用方在生成期间只会收到 `: keep-alive` 注释，随后一次性收到内容或 tool_calls。
 - **代码落盘**：当回复中包含代码块时，会从 DOM 提取并按语言保存；若无代码块则保存完整回复为 `.md`。
 - **不要提交 `user_data/`**：其中包含登录 Cookie / Session，属于敏感数据。
+- **不要绑定 `0.0.0.0`**：服务默认只监听 `127.0.0.1`，因为转发的是你的登录会话，暴露到网络等于把账号交出去。
+
+---
+
+## 🧪 测试
+
+```bash
+.venv/bin/python -m unittest discover -s tests -t . -v
+```
+
+回归测试用假 page 驱动结束判定，不需要启动浏览器，也不需要额外依赖（只用标准库 unittest）。
 
 ---
 

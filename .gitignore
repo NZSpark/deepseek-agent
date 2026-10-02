@@ -20,6 +20,9 @@ user_data/
 # Generated output
 output/
 
+# Local config (may contain environment-specific paths)
+.env
+
 # Local tooling
 .freebuff/
 

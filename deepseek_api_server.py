@@ -11,9 +11,64 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from playwright.async_api import async_playwright
+
+
+# ==================== 0. 配置加载 (.env) ====================
+# 所有可调参数集中在项目根目录的 .env（模板见 .env.example）。
+# 这里用一个极简的 .env 解析器，避免为读取配置引入额外依赖：
+#   * 已存在的真实环境变量优先于 .env（便于临时覆盖 / CI）；
+#   * 支持 `KEY=value`、`#` 注释、空行、值两侧引号。
+ENV_FILE = Path(__file__).resolve().parent / ".env"
+
+
+def _load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[配置] 读取 {path} 失败，将使用默认值：{exc}")
+        return
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_env_file(ENV_FILE)
+
+
+def env_str(key: str, default: str) -> str:
+    return os.environ.get(key, default)
+
+
+def env_int(key: str, default: int) -> int:
+    try:
+        return int(os.environ.get(key, str(default)))
+    except ValueError:
+        return default
+
+
+def env_float(key: str, default: float) -> float:
+    try:
+        return float(os.environ.get(key, str(default)))
+    except ValueError:
+        return default
+
+
+def env_bool(key: str, default: bool = False) -> bool:
+    raw = os.environ.get(key)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 # ==================== 1. 定义 OpenAI 兼容的数据结构 ====================
 # 参考: https://platform.openai.com/docs/api-reference/chat
@@ -60,7 +115,7 @@ class ChatCompletionRequest(BaseModel):
     stop: Optional[Any] = None
     # ---- 本地扩展字段（Pi 不会传，保持默认即可）----
     save_files: Optional[bool] = True
-    output_dir: Optional[str] = "./output"
+    output_dir: Optional[str] = None  # None -> 使用 .env 的 OUTPUT_DIR
 
 class ChoiceMessage(BaseModel):
     role: str = "assistant"
@@ -109,7 +164,9 @@ SUPPORTED_MODELS = [
 #   https://chat.deepseek.com/a/chat/s/<uuid>
 # 把最近一次成功的会话地址落盘，超时后可用它重新进入同一个会话，
 # 避免上下文丢失或停留在空白页。
-SESSION_FILE = Path("./user_data/.deepseek_session")
+SESSION_FILE = Path(env_str("SESSION_FILE", "./user_data/.deepseek_session"))
+USER_DATA_DIR = env_str("USER_DATA_DIR", "./user_data")
+OUTPUT_DIR = env_str("OUTPUT_DIR", "./output")
 _SESSION_URL_RE = re.compile(r"https://chat\.deepseek\.com/a/chat/s/[0-9a-fA-F-]+")
 
 
@@ -120,18 +177,42 @@ class DeepSeekTimeoutError(RuntimeError):
 # ==================== 2.6 回复结束检测 / 超时参数 ====================
 # 总超时（秒）：仅在「结束判定完全失灵 / 消息压根没发出去」时才会用到的兜底。
 # 必须小于 Pi 侧 HTTP 客户端的超时，否则客户端会先报错。可用 DEEPSEEK_TIMEOUT 覆盖。
-RESPONSE_TIMEOUT_S = float(os.environ.get("DEEPSEEK_TIMEOUT", "180"))
+RESPONSE_TIMEOUT_S = env_float("DEEPSEEK_TIMEOUT", 180)
 # 打开后每轮轮询都打印一行状态，便于定位「为什么一直判不到结束」（DEEPSEEK_DEBUG=1）
-DEBUG = os.environ.get("DEEPSEEK_DEBUG", "").lower() in {"1", "true", "yes", "on"}
+DEBUG = env_bool("DEEPSEEK_DEBUG")
 # 轮询间隔（秒）
-POLL_INTERVAL_S = 1.5
+POLL_INTERVAL_S = env_float("POLL_INTERVAL_S", 1.5)
 # 兜底判定：内容（忽略首尾空白）完全相同连续这么多次即认为生成结束
-STABLE_POLLS = 2
+STABLE_POLLS = env_int("STABLE_POLLS", 2)
 # 次保守的兜底：仅凭“长度不再增长”收尾时要多等几轮，
 # 避免生成中途的长停顿（如长思考）被误判成结束
-LEN_STABLE_POLLS = 4
+LEN_STABLE_POLLS = env_int("LEN_STABLE_POLLS", 4)
+# ---- DOM 选择器统一集中在这里，网页版改版时只需改这一处 ----
 # 回复节点的候选选择器
-RESPONSE_SELECTORS = '.ds-markdown, .markdown-body, div[class*="markdown"]'
+RESPONSE_SELECTORS = env_str(
+    "RESPONSE_SELECTORS", '.ds-markdown, .markdown-body, div[class*="markdown"]'
+)
+# 输入框候选选择器（.env 中用 "||" 分隔多个候选）
+INPUT_SELECTORS = [
+    s.strip()
+    for s in env_str(
+        "INPUT_SELECTORS",
+        'textarea[placeholder*="发送"]||textarea[placeholder*="Send"]||#chat-input||textarea',
+    ).split("||")
+    if s.strip()
+]
+# 页面就绪（输入框出现）用的选择器
+READY_SELECTOR = env_str("READY_SELECTOR", 'textarea, [contenteditable="true"]')
+# 代码块 DOM
+CODE_BLOCK_SELECTOR = env_str("CODE_BLOCK_SELECTOR", "pre")
+CODE_TAG_SELECTOR = env_str("CODE_TAG_SELECTOR", "code")
+
+# ---- 重试 / 运行模式 ----
+# 上游超时的最大尝试次数与退避基数（秒）
+MAX_UPSTREAM_RETRIES = env_int("DEEPSEEK_RETRIES", 2)
+RETRY_BACKOFF_S = env_float("RETRY_BACKOFF_S", 1.0)
+# 无显示环境（CI / 服务器）可用 HEADLESS=1 启动；首次登录仍需有头模式
+HEADLESS = env_bool("HEADLESS")
 
 
 # ==================== 2. 工具调用（function calling）桥接层 ====================
@@ -345,21 +426,52 @@ def _content_to_text(content: Any) -> str:
 
 
 def estimate_tokens(text: str) -> int:
-    """粗略估算 token 数（中文按 ~1 char/token，英文按 ~4 char/token 混合近似）。"""
+    """估算 token 数（仅用于填充 OpenAI 的 usage 字段，不是精确值）。
+
+    CJK 字符约 1 char/token，其余字符约 4 char/token。
+    不引入 tiktoken：那是 OpenAI 的分词器，算 DeepSeek 的 token 只会
+    得到一个“看起来很精确但其实是错的”数字，反而更容易误导客户端做上下文裁剪。
+    """
     if not text:
         return 0
-    return max(1, len(text) // 3)
+    cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff" or "\u3000" <= ch <= "\u30ff")
+    other = len(text) - cjk
+    return max(1, cjk + other // 4)
+
+
+def _delta_piece(streamed: str, current: str) -> tuple[Optional[str], str]:
+    """计算 ``current`` 相对「已经发给客户端的内容」真正新增的部分。
+
+    网页版在生成中可能重排 / 替换回复节点，导致 ``current`` 不再以之前的内容为前缀。
+    此时不能用简单的 ``startswith`` 判定（会静默丢字），也不应从头发一遍
+    （会重复）。这里退回「公共前缀之后的部分」。
+
+    :return: (需要补发的内容, 客户端补发后实际拥有的内容)；无新增时第一项为 None。
+    """
+    if current == streamed:
+        return None, streamed
+    if current.startswith(streamed):
+        return current[len(streamed):], current
+    limit = min(len(streamed), len(current))
+    index = 0
+    while index < limit and streamed[index] == current[index]:
+        index += 1
+    piece = current[index:] or None
+    return piece, streamed[:index] + (piece or "")
 
 
 # ==================== 3. 底层浏览器自动化 Driver ====================
 
 class DeepSeekWebDriver:
-    def __init__(self, user_data_dir: str = "./user_data"):
+    def __init__(self, user_data_dir: str = None):
+        user_data_dir = user_data_dir or USER_DATA_DIR
         self.user_data_dir = user_data_dir
         self.playwright = None
         self.context = None
         self.page = None
         self.lock = asyncio.Lock()
+        # 浏览器初始化失败时记录原因，让服务仍能启动并对外暴露可读错误
+        self.init_error: Optional[str] = None
 
     async def init(self):
         """初始化浏览器实例"""
@@ -367,7 +479,7 @@ class DeepSeekWebDriver:
         try:
             self.context = await self.playwright.chromium.launch_persistent_context(
                 user_data_dir=self.user_data_dir,
-                headless=False,
+                headless=HEADLESS,
                 args=["--disable-blink-features=AutomationControlled"]
             )
         except Exception as exc:  # noqa: BLE001
@@ -491,7 +603,7 @@ class DeepSeekWebDriver:
                 await self.page.goto(saved, wait_until="domcontentloaded")
             try:
                 await self.page.wait_for_selector(
-                    'textarea, [contenteditable="true"]', timeout=15000, state="visible"
+                    READY_SELECTOR, timeout=15000, state="visible"
                 )
             except Exception:
                 print("[恢复] 已打开会话，但未检测到输入框，请检查登录状态。")
@@ -511,15 +623,26 @@ class DeepSeekWebDriver:
         如果超时前已经读到实质回复，``_send_chat_locked`` 会直接返回内容，
         不再触发重发，避免网页多出一轮、与 Pi 的状态错位。
         """
-        await self._remember_session()
-        try:
-            return await self._send_chat_locked(prompt, on_delta)
-        except DeepSeekTimeoutError:
-            print("[恢复] 等待回复超时，尝试根据保存的会话链接恢复会话……")
-            if await self._recover_session():
-                await self._remember_session()
+        last_error: Optional[DeepSeekTimeoutError] = None
+        for attempt in range(1, MAX_UPSTREAM_RETRIES + 1):
+            await self._remember_session()
+            try:
                 return await self._send_chat_locked(prompt, on_delta)
-            raise
+            except DeepSeekTimeoutError as exc:
+                # 只有「超时」才可重试；找不到输入框、profile 被占用等属于不可重试
+                last_error = exc
+                if attempt >= MAX_UPSTREAM_RETRIES:
+                    break
+                print(
+                    f"[恢复] 等待回复超时（第 {attempt}/{MAX_UPSTREAM_RETRIES} 次），"
+                    "尝试根据保存的会话链接恢复会话后重试……"
+                )
+                if not await self._recover_session():
+                    break
+                await asyncio.sleep(RETRY_BACKOFF_S * attempt)
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("上游请求未能发送")
 
     # 主判定所用的 JS：扫描页面上可见的「停止生成」控件
     _GENERATING_JS = """
@@ -601,9 +724,9 @@ class DeepSeekWebDriver:
         extracted: List[dict] = []
         if element is None:
             return extracted
-        code_elements = await element.query_selector_all('pre')
+        code_elements = await element.query_selector_all(CODE_BLOCK_SELECTOR)
         for code_el in code_elements:
-            code_tag = await code_el.query_selector('code')
+            code_tag = await code_el.query_selector(CODE_TAG_SELECTOR)
             lang = "txt"
             if code_tag:
                 class_attr = await code_tag.get_attribute('class') or ""
@@ -627,15 +750,8 @@ class DeepSeekWebDriver:
         """
         async with self.lock:
             # 1. 定位并填入输入框
-            input_selectors = [
-                'textarea[placeholder*="发送"]',
-                'textarea[placeholder*="Send"]',
-                '#chat-input',
-                'textarea'
-            ]
-
             chat_input = None
-            for selector in input_selectors:
+            for selector in INPUT_SELECTORS:
                 try:
                     chat_input = await self.page.wait_for_selector(selector, timeout=3000)
                     if chat_input:
@@ -667,6 +783,7 @@ class DeepSeekWebDriver:
             last_text = ""
             last_normalized = ""
             last_len = -1
+            streamed = ""            # 已经通过 on_delta 发给客户端的内容
             stable_count = 0
             saw_generating = False      # 本轮是否观测到过页面「生成中」状态
             latest_node = None          # 本轮最新的回复节点
@@ -716,15 +833,17 @@ class DeepSeekWebDriver:
                     else:
                         stable_count = 0
 
-                    # 2.3 生成过程中吐出增量，供 SSE 使用
-                    if on_delta is not None and current_text.startswith(last_text):
-                        piece = current_text[len(last_text):]
+                    # 2.3 生成过程中吐出增量，供 SSE 使用。
+                    #     用「已发送内容」的公共前缀做 diff，即使节点中途重排也不会漏字
+                    if on_delta is not None:
+                        piece, streamed = _delta_piece(streamed, current_text)
                         if piece:
                             await on_delta(piece)
 
                     last_text = current_text
                     last_normalized = normalized
                     last_len = len(normalized)
+
                 if DEBUG:
                     print(
                         f"[debug] poll={poll} nodes={len(responses)} len={len(normalized)} "
@@ -800,11 +919,46 @@ driver = DeepSeekWebDriver()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await driver.init()
+    try:
+        await driver.init()
+        driver.init_error = None
+    except Exception as exc:  # noqa: BLE001
+        # 浏览器起不来时也让服务先启动：便于用 /healthz 定位问题，
+        # 并让 /v1/chat/completions 返回可读错误，而不是整个进程直接挂掉
+        driver.init_error = str(exc)
+        print(
+            f"\n[启动警告] 浏览器初始化失败：{exc}\n"
+            "服务仍会启动，可用 GET /healthz 查看状态。\n"
+        )
     yield
     await driver.close()
 
+
+def _error_response(status_code: int, message: str, err_type: str):
+    """以 OpenAI 兼容的 error 结构返回错误，而不是裸 500 字符串。"""
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": {"message": message, "type": err_type, "code": status_code}},
+    )
+
+
 app = FastAPI(title="DeepSeek Web-to-API Bridge", lifespan=lifespan)
+
+
+@app.get("/healthz", include_in_schema=False)
+async def healthz():
+    """健康检查：Pi 等客户端可用来探活。"""
+    ready = driver.page is not None
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={
+            "status": "ok" if ready else "degraded",
+            "browser_ready": ready,
+            "headless": HEADLESS,
+            "session_url": driver._current_session_url() if ready else None,
+            "init_error": driver.init_error,
+        },
+    )
 
 
 @app.get("/", include_in_schema=False)
@@ -812,7 +966,7 @@ async def root():
     return {
         "service": "DeepSeek Web-to-API Bridge",
         "openai_compatible": True,
-        "endpoints": ["/v1/models", "/v1/chat/completions", "/debug/dom"],
+        "endpoints": ["/v1/models", "/v1/chat/completions", "/healthz", "/debug/dom"],
     }
 
 
@@ -873,11 +1027,19 @@ async def debug_dom():
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def chat_completions(request: ChatCompletionRequest):
     if not request.messages:
-        raise HTTPException(status_code=400, detail="messages 不能为空")
+        return _error_response(400, "messages 不能为空", "invalid_request_error")
+
+    if driver.page is None:
+        return _error_response(
+            503,
+            "浏览器尚未就绪，请确认已完成登录、且没有另一个实例占用 user_data。"
+            f"初始化错误：{driver.init_error or '无'}",
+            "unavailable",
+        )
 
     prompt = DeepSeekWebDriver.build_prompt(request.messages, request.tools, request.tool_choice)
     if not prompt:
-        raise HTTPException(status_code=400, detail="需要包含至少一条 user / tool 消息")
+        return _error_response(400, "需要包含至少一条 user / tool 消息", "invalid_request_error")
 
     # ---------- 流式分支（Pi 默认 stream=true）----------
     if request.stream:
@@ -894,10 +1056,19 @@ async def chat_completions(request: ChatCompletionRequest):
     # ---------- 非流式分支 ----------
     try:
         reply_content, code_blocks = await driver.send_chat(prompt)
-    except Exception as e:
+    except DeepSeekTimeoutError as exc:
+        print("\n[ERR] 等待 DeepSeek 回复超时（已重试）:")
+        traceback.print_exc()
+        return _error_response(504, str(exc), "timeout")
+    except RuntimeError as exc:
+        # 浏览器不可用 / 找不到输入框等上游问题
+        print("\n[ERR] 上游浏览器不可用:")
+        traceback.print_exc()
+        return _error_response(502, str(exc), "upstream_error")
+    except Exception as exc:  # noqa: BLE001
         print("\n[ERR] 处理请求失败:")
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        return _error_response(500, str(exc), "server_error")
 
     wants_tools = bool(request.tools) and request.tool_choice != "none"
     tool_calls = parse_tool_calls(reply_content, _tool_names(request.tools)) if wants_tools else []
@@ -919,7 +1090,9 @@ async def chat_completions(request: ChatCompletionRequest):
 
     saved_files = []
     if request.save_files:
-        saved_files = driver.save_extracted_files(reply_content, code_blocks, request.output_dir)
+        saved_files = driver.save_extracted_files(
+            reply_content, code_blocks, request.output_dir or OUTPUT_DIR
+        )
 
     return ChatCompletionResponse(
         model=request.model,
@@ -985,12 +1158,21 @@ async def _stream_chat_completion(request: ChatCompletionRequest, prompt: str):
     streamed = False
     reply_content = ""
     error: Optional[str] = None
+    keepalives = 0
 
     while True:
         try:
             kind, payload = await asyncio.wait_for(queue.get(), timeout=10.0)
         except asyncio.TimeoutError:
-            # 网页版生成较慢，发送 SSE 注释保活，避免 Pi 侧超时断连
+            # 网页版生成较慢，发送 SSE 注释保活，避免 Pi 侧超时断连。
+            # 带 tools 时回复必须先完整缓冲才能判断是不是 tool_calls，
+            # 因此这段时间客户端看不到内容 —— 用注释保活 + 日志保持可观测。
+            keepalives += 1
+            if DEBUG:
+                print(
+                    f"[debug] 等待上游回复中（已发 {keepalives} 次 keep-alive，"
+                    f"工具模式={wants_tools}）"
+                )
             yield ": keep-alive\n\n"
             continue
 
@@ -1054,4 +1236,4 @@ async def _stream_chat_completion(request: ChatCompletionRequest, prompt: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host=env_str("HOST", "127.0.0.1"), port=env_int("PORT", 8000))
