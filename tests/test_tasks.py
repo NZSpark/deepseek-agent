@@ -30,7 +30,7 @@ class TaskSnapshotTests(unittest.TestCase):
         config.TASK_SNAPSHOT_ENABLED = self._orig_enabled
 
     @staticmethod
-    def _msgs(*pairs):
+    def _msgs(*pairs):  # noqa: D401
         return [ChatMessage(role=r, content=c) for r, c in pairs]
 
     def test_record_writes_goal_and_recent(self):
@@ -44,6 +44,24 @@ class TaskSnapshotTests(unittest.TestCase):
         self.assertEqual(data["goal"], "把仓库重构为 X")
         self.assertEqual(data["turns"], 1)
         self.assertTrue(any(m["text"] == "好的" for m in data["recent"]))
+
+    def test_environment_context_is_not_treated_as_goal(self):
+        """Codex 自动注入的 <environment_context> 不应被当成任务目标（跨项目串台来源）。"""
+        env = (
+            "<environment_context>\n"
+            "  <cwd>/Users/me/Github/GeminiBridge</cwd>\n"
+            "</environment_context>"
+        )
+        tasks.record("codex", self._msgs(("user", env), ("user", "真正的任务：修好 responses.py")))
+        data = tasks.load("codex")
+        self.assertEqual(data["goal"], "真正的任务：修好 responses.py")
+        self.assertNotIn("GeminiBridge", tasks.resume_block("codex"))
+
+    def test_environment_only_falls_back_gracefully(self):
+        env = "<environment_context>\n  <cwd>/tmp</cwd>\n</environment_context>"
+        tasks.record("only-env", self._msgs(("user", env)))
+        # 没有真正的用户消息时，兜底使用环境块，不为空
+        self.assertIn("environment_context", tasks.load("only-env")["goal"])
 
     def test_goal_is_sticky_across_turns(self):
         tasks.record("t", self._msgs(("user", "原始目标")))
@@ -68,10 +86,39 @@ class TaskSnapshotTests(unittest.TestCase):
 
     def test_bucket_name_is_filesystem_safe(self):
         tasks.record("../../etc/passwd", self._msgs(("user", "x")))
-        # 不应逃逸出目录
-        files = list(Path(self.tmp.name).glob("*.json"))
+        # 不应逃逸出目录（文件落在 namespace 子目录下）
+        files = list(Path(self.tmp.name).glob("*/*.json"))
         self.assertEqual(len(files), 1)
         self.assertTrue(str(files[0]).startswith(self.tmp.name))
+
+    def test_namespace_isolates_same_bucket(self):
+        """同名 bucket 在不同 namespace 下必须互不可见（跨项目防串台）。"""
+        orig_ns = config.TASK_NAMESPACE
+        self.addCleanup(lambda: setattr(config, "TASK_NAMESPACE", orig_ns))
+
+        config.TASK_NAMESPACE = "proj-a"
+        tasks.record("shared", self._msgs(("user", "A 项目的目标")))
+        config.TASK_NAMESPACE = "proj-b"
+        tasks.record("shared", self._msgs(("user", "B 项目的目标")))
+
+        config.TASK_NAMESPACE = "proj-a"
+        self.assertEqual(tasks.load("shared")["goal"], "A 项目的目标")
+        config.TASK_NAMESPACE = "proj-b"
+        self.assertEqual(tasks.load("shared")["goal"], "B 项目的目标")
+
+    def test_foreign_namespace_file_is_ignored(self):
+        """旧版本残留的、namespace 不匹配的快照文件必须被视为无效。"""
+        orig_ns = config.TASK_NAMESPACE
+        self.addCleanup(lambda: setattr(config, "TASK_NAMESPACE", orig_ns))
+        config.TASK_NAMESPACE = "mine"
+        target = Path(self.tmp.name) / "mine" / "t.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps({"namespace": "someone-else", "goal": "别项目的目标"}),
+            encoding="utf-8",
+        )
+        self.assertEqual(tasks.load("t"), {})
+        self.assertNotIn("别项目的目标", tasks.resume_block("t"))
 
 
 class BuildPromptTaskBlockTests(unittest.TestCase):

@@ -175,6 +175,14 @@ RESPONSES_TOOL_BUFFER = env_bool("RESPONSES_TOOL_BUFFER", True)
 TASK_SNAPSHOT_ENABLED = env_bool("TASK_SNAPSHOT_ENABLED", True)
 # 任务快照存放目录。
 TASK_FILE_DIR = env_str("TASK_FILE_DIR", "./user_data/.deepseek_tasks")
+# 任务快照命名空间：同一台机器上可能跑着多个「桥」（如 DeepseekBridge / GeminiBridge），
+# 若共用同一个 TASK_FILE_DIR，同名会话桶（default、ua:codex-tui…）会互相覆盖，
+# 表现为「A 项目读到 B 项目的任务目标」。
+# 默认由本包所在目录名派生（deepseek_web -> deepseek），
+# 使不同项目即使共用目录也天然隔离；也可用 TASK_NAMESPACE 显式覆盖。
+TASK_NAMESPACE = env_str("TASK_NAMESPACE", "") or (
+    Path(__file__).resolve().parent.name.split("_")[0] or "default"
+)
 # 任务目标（第一条 user 消息）保留的最大字符数；超出截断。
 TASK_GOAL_MAX_CHARS = env_int("TASK_GOAL_MAX_CHARS", 2000)
 # 快照里滚动保留的最近消息条数（用于“最近进展”）。

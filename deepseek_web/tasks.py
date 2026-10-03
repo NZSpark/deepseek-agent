@@ -14,6 +14,7 @@
 """
 
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -23,8 +24,14 @@ from .models import ChatMessage
 from .prompting import _content_to_text
 
 
+def _namespace() -> str:
+    """当前项目的任务命名空间（不同「桥」项目必须不同）。"""
+    return getattr(config, "TASK_NAMESPACE", "") or "default"
+
+
 def _dir() -> Path:
-    return Path(config.TASK_FILE_DIR)
+    # 按命名空间分子目录：即使多个项目共用同一个 TASK_FILE_DIR，也互不覆盖
+    return Path(config.TASK_FILE_DIR) / _namespace()
 
 
 def _file(bucket: str) -> Path:
@@ -34,13 +41,41 @@ def _file(bucket: str) -> Path:
 
 
 def _goal_from_messages(messages: List[ChatMessage]) -> str:
-    """取任务目标：第一条 user 消息（跳过 system）。"""
+    """取任务目标：第一条**真正的** user 消息（跳过 system 与环境包装块）。
+
+注意：Codex / 部分 Agent 会在每轮最前面自动注入 ``<environment_context>`` 之类的
+环境元信息（cwd、权限、时间等）。它不是“用户想做的事”，若当成 goal 存下来，
+resume 时就会看到“目标 = 另一个项目的 cwd”这种串台错觉。因此这里跳过纯包装块。
+"""
+    fallback = ""
     for message in messages:
-        if message.role == "user":
-            text = _content_to_text(message.content).strip()
-            if text:
-                return text[: max(1, config.TASK_GOAL_MAX_CHARS)]
-    return ""
+        if message.role != "user":
+            continue
+        text = _content_to_text(message.content).strip()
+        if not text:
+            continue
+        if _is_environment_wrapper(text):
+            # 仅作为兜底：整段对话里若只有环境块，才用它，避免 goal 为空
+            fallback = fallback or text
+            continue
+        return text[: max(1, config.TASK_GOAL_MAX_CHARS)]
+    return fallback[: max(1, config.TASK_GOAL_MAX_CHARS)]
+
+
+# Agent 自动注入的环境/元信息包装：整条消息只由这些标签构成时，不算“任务目标”
+_ENV_WRAPPER_RE = re.compile(
+    r"^\s*<(environment_context|user_instructions|system_instructions|env)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_environment_wrapper(text: str) -> bool:
+    """消息是否只是 Agent 注入的环境元信息（而非用户真实意图）。"""
+    stripped = text.strip()
+    if not _ENV_WRAPPER_RE.match(stripped):
+        return False
+    # 环境块通常以同名闭合标签结尾；只要没有明显的自然语言正文就判定为包装
+    return "\n" in stripped or stripped.endswith(">")
 
 
 def _recent_texts(messages: List[ChatMessage]) -> List[Dict[str, str]]:
@@ -50,7 +85,7 @@ def _recent_texts(messages: List[ChatMessage]) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
     for message in picked:
         text = _content_to_text(message.content).strip()
-        if text:
+        if text and not _is_environment_wrapper(text):
             out.append({"role": message.role, "text": text})
     return out
 
@@ -59,9 +94,16 @@ def load(bucket: str) -> Dict[str, Any]:
     try:
         raw = _file(bucket).read_text(encoding="utf-8")
         data = json.loads(raw)
-        return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+    if not isinstance(data, dict):
+        return {}
+    # 归属校验：旧版本可能把别的项目/别的命名空间的快照写在同一个位置，
+    # 一旦发现 namespace 不匹配就视为无效，避免串台。
+    owner = data.get("namespace")
+    if owner is not None and owner != _namespace():
+        return {}
+    return data
 
 
 def record(bucket: str, messages: List[ChatMessage]) -> None:
@@ -71,6 +113,7 @@ def record(bucket: str, messages: List[ChatMessage]) -> None:
     data = load(bucket)
     goal = data.get("goal") or _goal_from_messages(messages)
     payload = {
+        "namespace": _namespace(),
         "bucket": bucket,
         "goal": goal,
         "recent": _recent_texts(messages),
