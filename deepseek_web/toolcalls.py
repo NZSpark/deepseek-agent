@@ -27,6 +27,27 @@ _DSML_TOOL_RE = re.compile(
 )
 # 无标签但带 "tool_uses" 键的裸 JSON 对象（DOM 提取后标签可能丢失）
 _TOOL_USES_RE = re.compile(r"tool_uses\s*\"?\s*:", re.IGNORECASE)
+# DSML **结构化**形态（DeepSeek 原生工具 DSL，模型不听指令时会退回这种写法）：
+#   <｜｜DSML｜｜ calls>
+#   <｜｜DSML｜｜ invoke name="bash">
+#   <｜｜DSML｜｜ parameter name="command" string="true">cd /tmp && ls</｜｜DSML｜｜ parameter>
+#   </｜｜DSML｜｜ invoke>
+#   </｜｜DSML｜｜ calls>
+# 竖线数量不固定（DOM 提取后 1~3 个都出现过），标签内允许空白；
+# 闭标签还可能缺失/错位（回复被截断），解析时按开标签切块兜底。
+_BAR = r"[｜|]{1,4}"
+_DSML_INVOKE_OPEN_RE = re.compile(rf"<\s*{_BAR}\s*DSML\s*{_BAR}\s*invoke\b([^>]*)>", re.IGNORECASE)
+_DSML_INVOKE_CLOSE_RE = re.compile(rf"<\s*/\s*{_BAR}\s*DSML\s*{_BAR}\s*invoke\s*>", re.IGNORECASE)
+_DSML_PARAM_OPEN_RE = re.compile(rf"<\s*{_BAR}\s*DSML\s*{_BAR}\s*parameter\b([^>]*)>", re.IGNORECASE)
+_DSML_PARAM_CLOSE_RE = re.compile(rf"<\s*/\s*{_BAR}\s*DSML\s*{_BAR}\s*parameter\s*>", re.IGNORECASE)
+# 参数值的 JSON 标量识别（string="true" 时不参与）
+_DSML_SCALAR_RE = re.compile(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null", re.IGNORECASE)
+# DeepSeek 偶尔不用我们的工具名，而用 bash/shell 这类通用名；只有能唯一对应时才映射
+_DSML_GENERIC_NAMES = {
+    "bash", "sh", "shell", "terminal", "command", "cmd", "exec", "execute",
+    "run_command", "run_commands", "execute_command",
+}
+_SHELL_NAME_KEYWORDS = ("shell", "exec", "bash", "command", "term")
 
 
 def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
@@ -52,8 +73,28 @@ def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
         "```",
         "一次可输出多个 tool_call 代码块以并行调用多个工具；代码块之外不要输出多余解释。",
         "如果不需要调用任何工具，请直接给出最终回答，不要输出 tool_call 代码块。",
+        "工具名必须逐字使用上面列出的名字，不要自造 bash / shell 之类的通用名。",
+        "除 ```tool_call 围栏外，严禁输出 <｜DSML｜ ...>、<invoke>/<parameter>、<tool_calls> "
+        "等 XML/DSL 标记——那些格式不会被执行，任务会直接失败。",
     ]
     return "\n".join(lines)
+
+
+def format_tool_call_emphasis() -> str:
+    """新会话 / 重置会话时，放在播种 prompt **开头**的格式强调块。
+
+    新 bucket 没有“示范过正确格式”的历史轮次，模型最容易在这时候
+    退回原生 DSML 标记；把带围栏示例的完整格式再点一遍，双保险。
+    """
+    return "\n".join([
+        "[输出格式强调] 这是一个新会话（或刚被重置），以下规则本会话持续有效：",
+        "需要调用工具时，只输出一个或多个如下格式的代码块（arguments 必须是合法 JSON）：",
+        "```tool_call",
+        '{"name": "工具名", "arguments": {参数对象}}',
+        "```",
+        "工具名必须逐字使用 [工具调用说明] 中列出的名字，不要自造 bash / shell 之类的通用名。",
+        "禁止输出 <｜DSML｜ ...>、<invoke>/<parameter>、<tool_calls> 等 XML/DSL 标记——它们不会被执行。",
+    ])
 
 
 def _normalize_tool_entry(entry: Any) -> Optional[Dict[str, Any]]:
@@ -118,6 +159,89 @@ def _iter_balanced_objects(text: str):
                     start = -1
 
 
+def _dsml_blocks(open_re, close_re, text: str):
+    """按 DSML 开标签切出 (属性串, 块体)。
+
+    闭标签缺失/错位（回复被截断、DOM 吞标签）时，退化为取到下一个开标签或文末。
+    """
+    pos = 0
+    while True:
+        opened = open_re.search(text, pos)
+        if not opened:
+            return
+        start = opened.end()
+        closed = close_re.search(text, start)
+        nxt = open_re.search(text, start)
+        if closed and (nxt is None or closed.start() < nxt.start()):
+            yield opened.group(1), text[start:closed.start()]
+            pos = closed.end()
+        elif nxt:
+            yield opened.group(1), text[start:nxt.start()]
+            pos = nxt.start()
+        else:
+            yield opened.group(1), text[start:]
+            return
+
+
+def _dsml_attr(attrs: str, key: str) -> Optional[str]:
+    """从开标签的属性串里取 ``key=\"value\"``。"""
+    match = re.search(rf'(?:^|\s){re.escape(key)}\s*=\s*"([^"]*)"', attrs)
+    return match.group(1) if match else None
+
+
+def _dsml_param_value(raw: str, string_attr: Optional[str]) -> Any:
+    """DSML parameter 内容 -> Python 值。
+
+    ``string=\"true\"`` 原样保留；其余情况若整体是 JSON 标量/结构则还原类型
+    （数字、布尔），否则当字符串。
+    """
+    value = raw.strip()
+    if (string_attr or "").strip().lower() == "true":
+        return value
+    if value[:1] in "{[" or _DSML_SCALAR_RE.fullmatch(value):
+        try:
+            return json.loads(value)
+        except Exception:
+            return value
+    return value
+
+
+def _resolve_dsml_name(name: str, valid_names: Optional[set]) -> str:
+    """把 DSML invoke 的工具名对齐到客户端工具名；对不上就原样返回（后续过滤）。"""
+    if not name:
+        return name
+    if not valid_names:
+        return name
+    if name in valid_names:
+        return name
+    lowered = name.strip().lower()
+    for candidate in valid_names:
+        if candidate.lower() == lowered:
+            return candidate
+    if lowered in _DSML_GENERIC_NAMES:
+        hits = [c for c in valid_names if any(k in c.lower() for k in _SHELL_NAME_KEYWORDS)]
+        if len(hits) == 1:
+            return hits[0]
+    return name
+
+
+def _parse_dsml_invokes(text: str, valid_names: Optional[set] = None) -> List[Dict[str, Any]]:
+    """解析 DSML 结构化工具调用（invoke/parameter 形态）。"""
+    calls: List[Dict[str, Any]] = []
+    for attrs, body in _dsml_blocks(_DSML_INVOKE_OPEN_RE, _DSML_INVOKE_CLOSE_RE, text):
+        name = _dsml_attr(attrs, "name")
+        if not name:
+            continue
+        arguments: Dict[str, Any] = {}
+        for pattrs, pvalue in _dsml_blocks(_DSML_PARAM_OPEN_RE, _DSML_PARAM_CLOSE_RE, body):
+            pname = _dsml_attr(pattrs, "name")
+            if not pname:
+                continue
+            arguments[pname] = _dsml_param_value(pvalue, _dsml_attr(pattrs, "string"))
+        calls.append({"name": _resolve_dsml_name(name, valid_names), "arguments": arguments})
+    return calls
+
+
 def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[str, Any]]:
     """从模型回复中解析出工具调用列表。返回 [{"name": ..., "arguments": {...}}, ...]
 
@@ -165,6 +289,9 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
         # DSML 风格 XML 包裹的工具调用（网页版偶发输出）
         for match in _DSML_TOOL_RE.finditer(text):
             _consume(match.group(1), allow_bare_object=True)
+
+    if not calls:
+        calls.extend(_parse_dsml_invokes(text, valid_names))
 
     if not calls:
         for match in _JSON_FENCE_RE.finditer(text):

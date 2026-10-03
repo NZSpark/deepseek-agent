@@ -181,6 +181,51 @@ class ParseToolCallsTests(unittest.TestCase):
             [{"name": "exec_command", "arguments": {"cmd": "ls"}}],
         )
 
+    def test_dsml_invoke_parameter_form(self):
+        """DeepSeek 原生 DSML 结构化调用（invoke/parameter），此前完全解析不了。"""
+        text = (
+            '<｜｜DSML｜｜ calls>\n'
+            '<｜｜DSML｜｜ invoke name="exec_command">\n'
+            '<｜｜DSML｜｜ parameter name="cmd" string="true">'
+            'cd /tmp && ls && cat /tmp/a.py | head -100</｜｜DSML｜｜ parameter>\n'
+            '</｜｜DSML｜｜ invoke>\n'
+            '</｜｜DSML｜｜ calls>'
+        )
+        calls = srv.parse_tool_calls(text, {"exec_command"})
+        self.assertEqual(
+            calls,
+            [{"name": "exec_command",
+              "arguments": {"cmd": "cd /tmp && ls && cat /tmp/a.py | head -100"}}],
+        )
+
+    def test_dsml_invoke_generic_name_maps_to_unique_shell_tool(self):
+        """模型自造 bash/command 名时，能唯一对应就映射到客户端工具名。"""
+        text = (
+            '<｜｜DSML｜｜ invoke name="bash">\n'
+            '<｜｜DSML｜｜ parameter name="command" string="true">ls -la</｜｜DSML｜｜ parameter>\n'
+            '</｜｜DSML｜｜ invoke>'
+        )
+        calls = srv.parse_tool_calls(text, {"exec_command", "apply_patch"})
+        self.assertEqual(calls, [{
+            "name": "exec_command",
+            "arguments": {"command": "ls -la"},
+        }])
+        # 两个 shell 工具就无法唯一对应 -> 交回 valid_names 过滤，不张冠李戴
+        self.assertEqual(srv.parse_tool_calls(text, {"exec_command", "run_command"}), [])
+
+    def test_dsml_invoke_truncated_and_typed_params(self):
+        """闭标签缺失（回复截断）也能解析；非字符串参数还原类型。"""
+        text = (
+            '<｜DSML｜ invoke name="exec_command">\n'
+            '<｜DSML｜ parameter name="cmd" string="true">ls</｜DSML｜ parameter>\n'
+            '<｜DSML｜ parameter name="timeout" string="false">30'
+        )
+        calls = srv.parse_tool_calls(text, {"exec_command"})
+        self.assertEqual(calls, [{
+            "name": "exec_command",
+            "arguments": {"cmd": "ls", "timeout": 30},
+        }])
+
 
 class BuildPromptTests(unittest.TestCase):
     @staticmethod
@@ -225,6 +270,29 @@ class BuildPromptTests(unittest.TestCase):
         messages = [self._msg("user", "做点事")]
         prompt = srv.DeepSeekWebDriver.build_prompt(messages, tools, "none")
         self.assertNotIn("[工具调用说明]", prompt)
+
+    def test_seed_prompt_always_specifies_tool_call_format(self):
+        """新 bucket / 轮转播种的 prompt 必须点名 tool_call 格式，且禁止 DSML。"""
+        tools = [{"type": "function", "function": {"name": "exec_command"}}]
+        messages = [self._msg("system", "sys"), self._msg("user", "列目录")]
+        from deepseek_web.prompting import build_prompt
+        prompt = build_prompt(messages, tools, seed=True)
+        self.assertIn("[工具调用说明]", prompt)
+        self.assertIn("```tool_call", prompt)
+        self.assertIn("[输出格式强调]", prompt)
+        self.assertIn('{"name": "工具名", "arguments": {参数对象}}', prompt)
+        self.assertIn("DSML", prompt)
+        # 强调块（含围栏示例）在播种开头，完整说明在文末
+        self.assertLess(prompt.index("[输出格式强调]"), prompt.index("[工具调用说明]"))
+        self.assertLess(prompt.index('{"name": "工具名"'), prompt.index("[工具调用说明]"))
+
+    def test_instruction_forbids_dsml_and_invented_names(self):
+        from deepseek_web.toolcalls import format_tools_instruction
+        text = format_tools_instruction(
+            [{"type": "function", "function": {"name": "exec_command"}}]
+        )
+        self.assertIn("严禁输出 <｜DSML｜", text)
+        self.assertIn("不要自造", text)
 
     def test_no_messages_after_assistant_falls_back_to_last_user(self):
         messages = [self._msg("user", "早"), self._msg("assistant", "晚")]

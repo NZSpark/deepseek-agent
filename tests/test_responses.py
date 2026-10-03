@@ -145,6 +145,26 @@ class NonStreamTests(unittest.TestCase):
         data = resp if isinstance(resp, dict) else body(resp)
         self.assertEqual(data["output"][0]["content"][0]["text"], "OK")
 
+    def test_handle_responses_dsml_reply_becomes_function_call(self):
+        """DeepSeek 退回 DSML invoke 格式时，Codex 也必须收到 function_call。"""
+        dsml = (
+            '<｜｜DSML｜｜ calls>\n'
+            '<｜｜DSML｜｜ invoke name="exec_command">\n'
+            '<｜｜DSML｜｜ parameter name="cmd" string="true">ls -la</｜｜DSML｜｜ parameter>\n'
+            '</｜｜DSML｜｜ invoke>\n'
+            '</｜｜DSML｜｜ calls>'
+        )
+        driver = FakeDriver(reply=dsml)
+        req = make_request(input="hi", tools=[
+            {"type": "function", "name": "exec_command",
+             "parameters": {"type": "object"}},
+        ])
+        resp = run(responses.handle_responses(req, None, driver))
+        data = resp if isinstance(resp, dict) else body(resp)
+        self.assertEqual(data["output"][0]["type"], "function_call")
+        self.assertEqual(data["output"][0]["name"], "exec_command")
+        self.assertEqual(json.loads(data["output"][0]["arguments"]), {"cmd": "ls -la"})
+
     def test_handle_responses_browser_not_ready(self):
         driver = FakeDriver(browser_ready=False)
         resp = run(responses.handle_responses(make_request(input="hi"), None, driver))
