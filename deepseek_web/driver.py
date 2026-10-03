@@ -868,8 +868,10 @@ class DeepSeekWebDriver:
             # 新回复只会把旧节点内容改掉而不会让数量增长，
             # 那样会导致永远读不到本轮回复直接等到超时。
             before_text = ""
+            before_count = 0
             try:
                 before_nodes = await page.query_selector_all(config.RESPONSE_SELECTORS)
+                before_count = len(before_nodes)
                 if before_nodes:
                     before_text = (await before_nodes[-1].inner_text()).strip()
             except Exception:
@@ -902,17 +904,35 @@ class DeepSeekWebDriver:
                     current_text = await latest_node.inner_text()
                 normalized = current_text.strip()
 
-                # 1. 本轮回复是否已经出现：只要最后一条回复的内容与发送前不同即可。
-                #    （不看节点数量：长会话下新回复会原地替换旧节点，数量不增长）
-                reply_seen = bool(normalized) and normalized != before_text
+                # 1. 本轮回复是否已经出现。判据（满足其一即可）：
+                #    a) 末节点文本 != 发送前文本；
+                #    b) 节点数变多（短会话常见）；
+                #    c) 已经观测到过「生成中」——这说明本轮确已开始，
+                #       此时即使文本暂时等于 before_text（首帧还没渲染完）也算已出现。
+                #    注意：不能只看节点数——长会话下新回复会原地替换旧节点，数量不增长。
+                reply_seen = (
+                    (bool(normalized) and normalized != before_text)
+                    or (len(responses) > before_count)
+                    or saw_generating
+                )
 
                 # 1.1 还没有新回复时，周期性检查是否“会话到顶”。
                 #     到顶与“真的卡住”在外表上完全一样（页面不再产生新回复），
                 #     不主动看提示语就只能等到超时，而那时已经分不清原因了。
-                if not reply_seen and poll % cap_check_every == 0:
-                    if await self._page_shows_context_limit(bucket):
-                        self._mark_context_limit(bucket)
-                        raise self._context_limit_error()
+                if not reply_seen:
+                    # 1.1 周期性检查是否「会话到顶」。
+                    #     到顶与「真的卡住」在外表上完全一样（页面不再产生新回复），
+                    #     不主动看提示语就只能等到超时，而那时已经分不清原因了。
+                    if poll % cap_check_every == 0:
+                        if await self._page_shows_context_limit(bucket):
+                            self._mark_context_limit(bucket)
+                            raise self._context_limit_error()
+                    # 1.2 兜底：新回复迟迟不出现（页面既没生成中、文本也没变）。
+                    #     可能是 DOM 选择器没命中新回复、或模型直接复用旧节点。
+                    #     观察「是否生成中」一旦变 True 就交给下面的主逻辑。
+                    generating = await self._page_is_generating(bucket)
+                    if generating:
+                        saw_generating = True
 
                 if reply_seen:
                     # 2.1 主判定：页面「生成中」状态。一旦观测到过「停止生成」

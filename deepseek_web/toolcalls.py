@@ -13,8 +13,9 @@ from typing import Any, Dict, List, Optional
 
 from .models import FunctionCall, ToolCall
 
-# 仅匹配 "tool_call" / "tool-call" 围栏，避免误伤普通 ```json 代码块
-_TOOL_CALL_FENCE_RE = re.compile(r"```(tool[-_]call)\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+# 仅匹配 "tool_call" / "tool-call" 围栏，避免误伤普通 ```json 代码块。
+# 允许围栏被 DOM/引用符号包裹： ``> ```tool_call `` 这类形态也要能识别。
+_TOOL_CALL_FENCE_RE = re.compile(r"```\s*(tool[-_]call)\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 # "json" 围栏仅在内容明显是工具调用时才采纳（兜底，兼容模型不听话的情况）
 _JSON_FENCE_RE = re.compile(r"```json\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 # 网页版偶尔会输出 DSML 风格的工具调用 XML（全角竖线 ｜｜ 包裹的标签），
@@ -177,18 +178,35 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
                 break
 
     if not calls:
-        # 兜底：无围栏的 "tool_call" 标签 + 平衡 JSON 对象（网页 DOM 提取后的形态）
-        marker_re = re.compile(r"tool[-_]?call\b", re.IGNORECASE)
+        # 兜底：无围栏的 "tool_call" 标签 + 平衡 JSON 对象（网页 DOM 提取后的形态）。
+        # DeepSeek 把 ``` 围栏渲染成 <pre> 后 inner_text 常退化成：
+        #   > tool_call            （markdown 引用/渲染残留）
+        #   tool_call\n{...}
+        #   ｜｜tool_call｜｜\n{...}
+        # 因此 marker 与 JSON 之间可能夹着 > 、竖线、空白等噪声，需要跳过它们再找 JSON。
+        # 不能用 \b：中文/全角字符（如 丨 ｜）在 Python re 里算 \w，
+        # 会让 "tool_call丨" 这种边界匹配失败。改用「后面不是 ASCII 标识符字符」判定。
+        marker_re = re.compile(r"tool[-_]?call(?![A-Za-z0-9_])", re.IGNORECASE)
+        noise_re = re.compile(r"^[\s>|｜丨`\-]+$")  # 只由噪声字符组成的行
         pos = 0
         while True:
             match = marker_re.search(text, pos)
             if not match:
                 break
             segment = text[match.end():]
+            # 跳过紧跟在 marker 之后的纯噪声行（>、竖线、围栏残留等），
+            # 让 _iter_balanced_objects 从真正的 JSON 花括号开始扫。
+            cursor = 0
+            for line in segment.splitlines(keepends=True):
+                if noise_re.match(line.strip()):
+                    cursor += len(line)
+                else:
+                    break
+            probe = segment[cursor:]
             parsed = False
-            for obj in _iter_balanced_objects(segment):
+            for obj in _iter_balanced_objects(probe):
                 _consume(obj, allow_bare_object=True)
-                pos = match.end() + segment.index(obj) + len(obj)
+                pos = match.end() + cursor + probe.index(obj) + len(obj)
                 parsed = True
                 break
             if not parsed:
