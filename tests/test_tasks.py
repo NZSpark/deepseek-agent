@@ -79,6 +79,50 @@ class TaskSnapshotTests(unittest.TestCase):
     def test_resume_block_empty_without_snapshot(self):
         self.assertEqual(tasks.resume_block("never-seen"), "")
 
+    CATCHUP = (
+        "Write a brief catch-up for a user returning to this task. "
+        "Return JSON with summary and nullable next_action.\n\n"
+        "Summary: explain the broader active goal..."
+    )
+
+    def test_catchup_meta_prompt_is_not_goal(self):
+        """客户端注入的交接/摘要请求不是任务目标；
+        否则新 bucket 会按它去写 JSON，真实任务被中断。"""
+        tasks.record("codex-meta", self._msgs(
+            ("user", self.CATCHUP),
+            ("user", "按 doc/tasks.md 检查本项目"),
+        ))
+        self.assertEqual(
+            tasks.load("codex-meta")["goal"], "按 doc/tasks.md 检查本项目"
+        )
+        block = tasks.resume_block("codex-meta")
+        self.assertNotIn("next_action", block)
+        self.assertIn("按 doc/tasks.md 检查本项目", block)
+
+    def test_meta_only_conversation_has_no_goal(self):
+        tasks.record("meta-only", self._msgs(("user", self.CATCHUP)))
+        self.assertEqual(tasks.load("meta-only").get("goal"), "")
+        self.assertEqual(tasks.resume_block("meta-only"), "")
+
+    def test_poisoned_goal_is_never_injected_and_self_heals(self):
+        """已存盘的污染 goal：注入前必须忽略，下一轮 record 自动换成真实目标。"""
+        target = Path(self.tmp.name) / config.TASK_NAMESPACE / "p.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps({
+            "namespace": config.TASK_NAMESPACE,
+            "bucket": "p",
+            "goal": self.CATCHUP,
+            "recent": [{"role": "user", "text": "真实任务：改 README"}],
+        }, ensure_ascii=False), encoding="utf-8")
+
+        block = tasks.resume_block("p")
+        self.assertNotIn("next_action", block)
+        self.assertNotIn("任务目标", block)
+        self.assertIn("真实任务：改 README", block)
+
+        tasks.record("p", self._msgs(("user", "真实任务：改 README")))
+        self.assertEqual(tasks.load("p")["goal"], "真实任务：改 README")
+
     def test_disabled_writes_nothing(self):
         config.TASK_SNAPSHOT_ENABLED = False
         tasks.record("t", self._msgs(("user", "x")))
