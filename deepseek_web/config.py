@@ -99,6 +99,24 @@ STABLE_POLLS = env_int("STABLE_POLLS", 2)
 # 次保守的兜底：仅凭“长度不再增长”收尾时要多等几轮，
 # 避免生成中途的长停顿（如长思考）被误判成结束
 LEN_STABLE_POLLS = env_int("LEN_STABLE_POLLS", 4)
+# 快速失败：连续这么多轮「选择器一个回复节点都匹配不到」就判为异常并立刻报错，
+# 而不是干等到 RESPONSE_TIMEOUT_S（选择器失效 / 消息没发出去时，等满超时毫无意义）。
+NO_NODE_FAIL_POLLS = env_int("NO_NODE_FAIL_POLLS", 10)
+# 看门狗：连续这么多轮「既没看到新回复、又没看到生成中状态」就提前结束，
+# 避免一直耗到总超时。应显著大于 NO_NODE_FAIL_POLLS，给慢启动留出余地。
+NO_PROGRESS_FAIL_POLLS = env_int("NO_PROGRESS_FAIL_POLLS", 40)
+# 「继续生成」按钮：网页版一次回复被截断时会显示「继续」按钮，点击后接着生成。
+# 打开后，判定本轮生成结束时若页面上还有该按钮，就自动点击并继续收集，
+# 直到没有继续按钮为止（拼出完整回复）。
+CONTINUE_BUTTON_ENABLED = env_bool("CONTINUE_BUTTON_ENABLED", True)
+# 单个会话最多自动点击「继续」多少次，防止按钮常驻 / 反复出现导致无限点击。
+CONTINUE_BUTTON_MAX = env_int("CONTINUE_BUTTON_MAX", 5)
+# 「继续」按钮文案（大小写不敏感），用于识别底部区域可见的继续控件。
+CONTINUE_BUTTON_TEXTS = [
+    t.strip()
+    for t in env_str("CONTINUE_BUTTON_TEXTS", "继续||continue||继续生成||continue generating").split("||")
+    if t.strip()
+]
 
 
 # ==================== 重试 ====================
